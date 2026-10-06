@@ -11,12 +11,13 @@ use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
 };
-use browseros_core::PageId;
+use browseros_cdp::{CdpError, CdpEvent, SessionId as CdpSessionId};
+use browseros_core::{BrowserSession, BrowserSessionHooks, CdpConnection, PageId};
 use browseros_mcp::InnerCallHook;
 use claw_server_rust::{
     AppState,
     api::mcp::{
-        dispatch::{ToolCall, dispatch_tool_call},
+        dispatch::{ToolCall, ToolIdentity, dispatch_tool_call},
         helper_runtime::execute_nested,
         script_hook::ScriptInnerCallHook,
     },
@@ -24,12 +25,14 @@ use claw_server_rust::{
     config::Config,
     freedom::{
         BoundAttempt, CODE_BUSINESS, CODE_CONTEXT_REQUIRED, CODE_LATE_AUDIT, CODE_MODE_FIXED,
-        CODE_RAW_EXEC, CODE_SCOPE, FreedomVerifier, InProcessVerifier, Scope, VerifyFailure,
+        CODE_RAW_EXEC, CODE_SCHEME, CODE_SCOPE, CODE_UNSCOPED, ClosedVerifier, FreedomVerifier,
+        InProcessVerifier, Scope, VerifyFailure,
     },
     identity::{ClientIdentity, ConversationIdentity},
     ids::SessionId,
     services::sessions::Session,
 };
+use futures_util::future::BoxFuture;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
 use std::{
@@ -38,6 +41,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -786,5 +790,334 @@ async fn label_is_not_sent_to_the_verifier() -> anyhow::Result<()> {
     let recorded = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     assert!(recorded.iter().any(|item| item == &secret));
     assert!(recorded.iter().all(|item| item != "Ted"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn finding1_tabs_active_and_new_do_not_reach_upstream() -> anyhow::Result<()> {
+    let (_dir, state, token) = managed_app(Scope::pages([1])).await?;
+    let active = dispatch_named(
+        &state,
+        "tabs",
+        json!({"action": "active", "page": 1}),
+        Some(token.clone()),
+        None,
+        false,
+    )
+    .await?;
+    assert_denied(&active, CODE_UNSCOPED);
+
+    let opened = dispatch_named(
+        &state,
+        "tabs",
+        json!({
+            "action": "new",
+            "url": "https://example.com/new",
+            "groupId": "group-outside-the-grant"
+        }),
+        Some(token.clone()),
+        None,
+        false,
+    )
+    .await?;
+    assert_denied(&opened, CODE_UNSCOPED);
+    assert!(!tool_text(&opened).contains("group-outside-the-grant"));
+
+    let wrapped = dispatch_named(
+        &state,
+        "tabs",
+        json!({"action": "new", "url": "view-source:file:///etc/passwd"}),
+        Some(token),
+        None,
+        false,
+    )
+    .await?;
+    assert_denied(&wrapped, CODE_SCHEME);
+    Ok(())
+}
+
+#[tokio::test]
+async fn finding4_garbage_marker_refuses_standalone_opener() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let profile = dir.path().join("profile");
+    tokio::fs::create_dir_all(&profile).await?;
+    tokio::fs::write(
+        profile.join("freedom-managed-profile.json"),
+        br#"{"mode":"standalone"}"#,
+    )
+    .await?;
+    let opened = AppState::new_with_home(config_at(&profile), home).await;
+    assert!(opened.is_err(), "garbage marker opened as standalone");
+
+    let blocked = dir.path().join("blocked");
+    tokio::fs::create_dir_all(&blocked).await?;
+    tokio::fs::create_dir(blocked.join("freedom-managed-profile.json")).await?;
+    let unreadable =
+        AppState::new_with_home(config_at(&blocked), dir.path().join("home-unreadable")).await;
+    assert!(
+        unreadable.is_err(),
+        "unreadable marker opened as standalone"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn finding5_symlink_onto_standalone_refuses_before_the_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let standalone = dir.path().join("standalone");
+    tokio::fs::create_dir_all(&standalone).await?;
+    let link = dir.path().join("managed-link");
+    std::os::unix::fs::symlink(&standalone, &link)?;
+    let opened = AppState::new_managed_with_home(
+        config_at(&link),
+        home,
+        standalone.clone(),
+        Arc::new(ClosedVerifier),
+    )
+    .await;
+    assert!(opened.is_err(), "symlink onto standalone was accepted");
+    assert!(!standalone.join("freedom-managed-profile.json").exists());
+
+    let third = dir.path().join("third");
+    tokio::fs::create_dir_all(&third).await?;
+    let distinct = dir.path().join("distinct-link");
+    std::os::unix::fs::symlink(&third, &distinct)?;
+    let accepted = AppState::new_managed_with_home(
+        config_at(&distinct),
+        dir.path().join("home-ok"),
+        standalone,
+        Arc::new(ClosedVerifier),
+    )
+    .await?;
+    assert!(accepted.freedom.is_managed());
+    assert!(third.join("freedom-managed-profile.json").is_file());
+    Ok(())
+}
+
+struct FixtureConnection {
+    events: broadcast::Sender<CdpEvent>,
+    url: &'static str,
+    cancel_on_tabs: Option<CancellationToken>,
+}
+
+impl FixtureConnection {
+    fn new(url: &'static str, cancel_on_tabs: Option<CancellationToken>) -> Arc<Self> {
+        let (events, _) = broadcast::channel(1);
+        Arc::new(Self {
+            events,
+            url,
+            cancel_on_tabs,
+        })
+    }
+}
+
+impl CdpConnection for FixtureConnection {
+    fn send<'a>(
+        &'a self,
+        method: &'a str,
+        _params: Value,
+        _session: Option<&'a CdpSessionId>,
+    ) -> BoxFuture<'a, Result<Value, CdpError>> {
+        let url = self.url;
+        let cancel = self.cancel_on_tabs.clone();
+        Box::pin(async move {
+            if method == "Browser.getTabs" {
+                if let Some(cancel) = cancel {
+                    cancel.cancel();
+                }
+                return Ok(json!({ "tabs": [{
+                    "tabId": 11,
+                    "targetId": "target-a",
+                    "url": url,
+                    "title": "Example",
+                    "isActive": true,
+                    "isLoading": false,
+                    "loadProgress": 1.0,
+                    "isPinned": false,
+                    "isHidden": false,
+                    "windowId": 1,
+                    "index": 0
+                }] }));
+            }
+            Err(CdpError::Protocol {
+                code: -1,
+                message: "fixture has no page session".to_string(),
+            })
+        })
+    }
+
+    fn send_raw_json<'a>(
+        &'a self,
+        _method: &'a str,
+        _params_json: &'a str,
+        _session: Option<&'a CdpSessionId>,
+    ) -> BoxFuture<'a, Result<String, CdpError>> {
+        Box::pin(async { Ok("{}".to_string()) })
+    }
+
+    fn events(&self) -> broadcast::Receiver<CdpEvent> {
+        self.events.subscribe()
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn connection_epoch(&self) -> u64 {
+        1
+    }
+}
+
+async fn dispatch_with_browser(
+    state: &AppState,
+    tool: &str,
+    args: Value,
+    token: Option<String>,
+    identity: Option<ToolIdentity>,
+    browser: Option<Arc<BrowserSession>>,
+    client_cancel: CancellationToken,
+) -> anyhow::Result<CallToolResult> {
+    let catalog = Arc::new(browseros_mcp::catalog());
+    let tool_index = catalog
+        .iter()
+        .position(|entry| entry.name == tool)
+        .ok_or_else(|| anyhow::anyhow!("missing tool {tool}"))?;
+    let mut call = ToolCall::new(
+        catalog,
+        tool_index,
+        args,
+        SessionId::new("s1"),
+        identity,
+        browser,
+        CancellationToken::new(),
+        client_cancel,
+        CancellationToken::new(),
+        None,
+        state.clone(),
+        browseros_mcp::output_file::create_browser_output_file_access(),
+    );
+    call.set_freedom_auth(token, None);
+    dispatch_tool_call(call)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn fresh_session(id: &str) -> Arc<Session> {
+    Session::new(
+        SessionId::new(id),
+        ClientIdentity::Ephemeral {
+            slug: "self".to_string(),
+            label: "Self".to_string(),
+        },
+        ConversationIdentity::new("self", format!("{id}-convo")),
+        "Self".to_string(),
+        tokio::time::Instant::now(),
+    )
+}
+
+#[tokio::test]
+async fn finding6_page_text_is_not_a_cancellation() -> anyhow::Result<()> {
+    let (_dir, state, token) = managed_app(Scope::pages([1])).await?;
+    let phrase = "Operation cancelled by the User";
+    let browser = BrowserSession::new(
+        FixtureConnection::new("https://example.test/Operation cancelled by the User", None),
+        BrowserSessionHooks::default(),
+    );
+    assert_eq!(browser.pages.list().await?.len(), 1);
+    let before = state.freedom.audit_trail();
+    let result = dispatch_with_browser(
+        &state,
+        "read",
+        json!({"page": 1, "format": "console"}),
+        Some(token),
+        None,
+        Some(browser),
+        CancellationToken::new(),
+    )
+    .await?;
+    let text = tool_text(&result);
+    assert!(text.contains(phrase), "{text}");
+    assert!(!text.contains(CODE_LATE_AUDIT), "{text}");
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert_eq!(state.freedom.audit_trail(), before);
+    assert!(!state.freedom.effect_is_audit_only(1));
+    assert_eq!(
+        state.freedom.try_mark_business_accepted(1),
+        Err(CODE_BUSINESS)
+    );
+    assert!(!state.freedom.effect_business_accepted(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn finding6_operator_stop_settles_audit_only() -> anyhow::Result<()> {
+    let (_dir, state, token) = managed_app(Scope::pages([1])).await?;
+    let session = fresh_session("operator");
+    session.request_operator_stop();
+    state.sessions.insert_for_testing(session.clone()).await;
+    let identity = ToolIdentity {
+        agent: session.agent().clone(),
+        ownership_key: session.convo_id().clone(),
+        agent_label: "Self".to_string(),
+        session,
+    };
+    let browser = BrowserSession::new(
+        FixtureConnection::new("https://granted.example/ok", None),
+        BrowserSessionHooks::default(),
+    );
+    assert_eq!(browser.pages.list().await?.len(), 1);
+    let result = dispatch_with_browser(
+        &state,
+        "read",
+        json!({"page": 1, "format": "console"}),
+        Some(token),
+        Some(identity),
+        Some(browser),
+        CancellationToken::new(),
+    )
+    .await?;
+    let text = tool_text(&result);
+    assert!(text.contains(CODE_LATE_AUDIT), "{text}");
+    assert!(!text.contains("granted.example"), "{text}");
+    assert!(state.freedom.effect_is_audit_only(1));
+    assert_eq!(
+        state.freedom.try_mark_business_accepted(1),
+        Err(CODE_LATE_AUDIT)
+    );
+    assert!(!state.freedom.effect_business_accepted(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn finding6_client_cancel_during_tool_is_audit_only() -> anyhow::Result<()> {
+    let (_dir, state, token) = managed_app(Scope::pages([1])).await?;
+    let client_cancel = CancellationToken::new();
+    let browser = BrowserSession::new(
+        FixtureConnection::new("https://granted.example/slow", Some(client_cancel.clone())),
+        BrowserSessionHooks::default(),
+    );
+    let result = dispatch_with_browser(
+        &state,
+        "read",
+        json!({"page": 1}),
+        Some(token),
+        None,
+        Some(browser),
+        client_cancel,
+    )
+    .await?;
+    let text = tool_text(&result);
+    assert!(text.contains(CODE_LATE_AUDIT), "{text}");
+    assert!(!text.contains("granted.example"), "{text}");
+    assert!(state.freedom.effect_is_audit_only(1));
+    assert_eq!(
+        state.freedom.try_mark_business_accepted(1),
+        Err(CODE_LATE_AUDIT)
+    );
     Ok(())
 }

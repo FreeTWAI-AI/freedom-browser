@@ -23,13 +23,13 @@ pub use guard::{
     CODE_GRANT_REVOKED, CODE_LATE_AUDIT, CODE_MODE_FIXED, CODE_PROFILE, CODE_RAW_EXEC, CODE_SCHEME,
     CODE_SCOPE, CODE_TARGET, CODE_TOKEN_INVALID, CODE_UNSCOPED, Disposition, HttpGate,
     PipelineOutcome, STEP_BEGIN, STEP_BOUND_ATTEMPT, STEP_DOMAIN, STEP_EXECUTE, STEP_NATIVE_AUTH,
-    STEP_OBSERVATION, STEP_RECEIPT, STEP_SCHEMA, ToolRequest, decide_http, precheck_mcp_tool,
-    run_tool_pipeline, tool_denial,
+    STEP_OBSERVATION, STEP_RECEIPT, STEP_SCHEMA, ToolRequest, decide_http, granted_help_page,
+    navigation_url_allowed, precheck_mcp_tool, run_tool_pipeline, tool_denial,
 };
 pub use local_api::{FreedomLocalAuth, LocalError, loopback_bind_addr, refuse_non_loopback};
 pub use mode::{
-    ModeError, ProfileError, StartupRequest, ensure_distinct, profile_is_managed, resolve_startup,
-    settings_try_to_relax, write_managed_marker,
+    ModeError, ProfileError, StartupRequest, bind_distinct_profiles, ensure_distinct,
+    profile_is_managed, resolve_startup, settings_try_to_relax, write_managed_marker,
 };
 pub use registry::{SurfaceEntry, SurfaceKind, Treatment, find_id, surfaces};
 

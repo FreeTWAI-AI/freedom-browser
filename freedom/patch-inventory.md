@@ -12,18 +12,19 @@ This list is the set of paths that differ from that commit. License and notice f
 | `freedom/upstream.lock.json` | new | Pins the upstream repository, research pin, adopted base, license expression, and preserved notice files. |
 | `packages/browseros-agent/apps/claw-server-rust/src/api/http/mod.rs` | modified | Runs the managed-mode HTTP gate before handlers, adds loopback `/freedom/v1/status`, and stops wildcard CORS in managed mode. |
 | `packages/browseros-agent/apps/claw-server-rust/src/api/http/settings.rs` | modified | Rejects settings writes that try to switch or relax managed mode, without applying the rest of that write. |
-| `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/dispatch.rs` | modified | Sends managed tool calls through the Freedom pipeline before the upstream guards, and denies raw `run`/`evaluate` again inside execution. |
+| `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/dispatch.rs` | modified | Sends managed tool calls through the Freedom pipeline before the upstream guards. Cancellation uses the client token and the operator stop flag, not result text. |
+| `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/guards/navigate_scheme.rs` | modified | In managed mode, navigate calls the shared http(s) and about:blank allowlist. Standalone keeps the upstream scheme refusal and its English error text. |
 | `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/helper_runtime.rs` | modified | Denies nested helper execution in managed mode and skips helper preload and discovery. |
 | `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/mod.rs` | modified | Re-exports server-local MCP tool names so the coverage registry can see them. |
 | `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/script_hook.rs` | modified | Denies nested script primitives, helper reads, and page claims while the process is managed. |
-| `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/service.rs` | modified | Prechecks every MCP tool call before session resolution, and runs server-local tools through the same pipeline. |
-| `packages/browseros-agent/apps/claw-server-rust/src/app.rs` | modified | Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and builds a managed state in its own directory. |
+| `packages/browseros-agent/apps/claw-server-rust/src/api/mcp/service.rs` | modified | Prechecks every MCP tool call before session resolution. Managed `request_human_help` pins only the granted page, not the cockpit active tab. |
+| `packages/browseros-agent/apps/claw-server-rust/src/app.rs` | modified | Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and binds a managed state only after the profile resolves to a distinct directory. |
 | `packages/browseros-agent/apps/claw-server-rust/src/config.rs` | modified | Adds the startup-only `--freedom-managed` and `--freedom-profile` flags and the default standalone directory helper. |
 | `packages/browseros-agent/apps/claw-server-rust/src/freedom/context.rs` | new | Verifying constructor for `FreedomRunContext`. No `Default`, no public fields, and no deserializer. |
-| `packages/browseros-agent/apps/claw-server-rust/src/freedom/guard.rs` | new | Managed-mode pipeline: auth, bound attempt, schema, target guard, begin, execute, observation, and receipt. |
+| `packages/browseros-agent/apps/claw-server-rust/src/freedom/guard.rs` | new | Managed-mode pipeline. `tabs` `active` and `new` are unscoped, `request_human_help` needs an in-scope page, and navigation URLs are an http(s) or `about:blank` allowlist. |
 | `packages/browseros-agent/apps/claw-server-rust/src/freedom/local_api.rs` | new | Loopback peer, Host, Origin, per-process native token, and single-use nonce checks for `/freedom/v1`. |
 | `packages/browseros-agent/apps/claw-server-rust/src/freedom/mod.rs` | new | Process-wide Freedom runtime. Mode is fixed after startup and the journal never records business acceptance. |
-| `packages/browseros-agent/apps/claw-server-rust/src/freedom/mode.rs` | new | Resolves managed versus standalone from the CLI and sidecar, and enforces a distinct managed profile. |
+| `packages/browseros-agent/apps/claw-server-rust/src/freedom/mode.rs` | new | Resolves managed versus standalone from the CLI and sidecar. An existing marker file is managed. Profiles are compared after canonicalization. |
 | `packages/browseros-agent/apps/claw-server-rust/src/freedom/registry.rs` | new | Coverage registry of HTTP routes, MCP tools, and native entry points with managed-mode treatment. |
 | `packages/browseros-agent/apps/claw-server-rust/src/lib.rs` | modified | Declares the freedom module. |
 | `packages/browseros-agent/apps/claw-server-rust/src/main.rs` | modified | Selects managed mode only at process start, binds `127.0.0.1`, and publishes the bound port for the Host allowlist. |

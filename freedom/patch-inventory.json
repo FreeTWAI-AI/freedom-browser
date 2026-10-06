@@ -35,7 +35,12 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/dispatch.rs",
       "status": "modified",
-      "purpose": "Sends managed tool calls through the Freedom pipeline before the upstream guards, and denies raw run/evaluate again inside execution."
+      "purpose": "Sends managed tool calls through the Freedom pipeline before the upstream guards. Cancellation uses the client token and the operator stop flag, not result text."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/guards/navigate_scheme.rs",
+      "status": "modified",
+      "purpose": "In managed mode, navigate calls the shared http(s) and about:blank allowlist. Standalone keeps the upstream scheme refusal and its English error text."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/helper_runtime.rs",
@@ -55,12 +60,12 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/service.rs",
       "status": "modified",
-      "purpose": "Prechecks every MCP tool call before session resolution, and runs server-local tools through the same pipeline."
+      "purpose": "Prechecks every MCP tool call before session resolution. Managed request_human_help pins only the granted page, not the cockpit active tab."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/app.rs",
       "status": "modified",
-      "purpose": "Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and builds a managed state in its own directory."
+      "purpose": "Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and binds a managed state only after the profile resolves to a distinct directory."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/config.rs",
@@ -75,7 +80,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/guard.rs",
       "status": "new",
-      "purpose": "Managed-mode pipeline: auth, bound attempt, schema, target guard, begin, execute, observation, and receipt."
+      "purpose": "Managed-mode pipeline. tabs active and new are unscoped, request_human_help needs an in-scope page, and navigation URLs are an http(s) or about:blank allowlist."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/local_api.rs",
@@ -90,7 +95,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/mode.rs",
       "status": "new",
-      "purpose": "Resolves managed versus standalone from the CLI and sidecar, and enforces a distinct managed profile."
+      "purpose": "Resolves managed versus standalone from the CLI and sidecar. An existing marker file is managed. Profiles are compared after canonicalization."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/registry.rs",

@@ -75,7 +75,6 @@ const SESSION_TOOLS: &[&str] = &[
     "name_session",
     "save_skill",
     "mark_skill_run",
-    "request_human_help",
     "await_human_help",
 ];
 const UNSCOPED_TOOLS: &[&str] = &["history", "windows", "tab_groups"];
@@ -436,7 +435,11 @@ fn admit(
         steps.push(STEP_SCHEMA);
         return Err(denial(CODE_RAW_EXEC, MSG_RAW, steps));
     }
-    if request.url.as_deref().is_some_and(scheme_denied) {
+    if request
+        .url
+        .as_deref()
+        .is_some_and(|url| !navigation_url_allowed(url))
+    {
         steps.push(STEP_SCHEMA);
         return Err(denial(CODE_SCHEME, MSG_SCHEME, steps));
     }
@@ -498,11 +501,21 @@ fn domain(
         return Ok(());
     }
     if request.tool == "tabs" {
+        // `list` is answered from the grant and never reaches upstream.
+        // `active` reads whichever tab is active, including a human tab.
+        // `new` opens `url`, honors `groupId`, and snapshots the new page,
+        // which is not in the grant. Both are unscoped. `close` still names
+        // a page id. A later scoped `new` must ignore `groupId` and must not
+        // snapshot a page id that is absent from the grant.
         return match request.tabs_action.as_deref().unwrap_or("list") {
-            "list" | "new" => Ok(()),
-            "close" | "active" => require_page(context, request.page),
+            "list" => Ok(()),
+            "active" | "new" => Err((CODE_UNSCOPED, MSG_UNSCOPED)),
+            "close" => require_page(context, request.page),
             _ => Err((CODE_TARGET, MSG_TARGET)),
         };
+    }
+    if request.tool == "request_human_help" {
+        return require_page(context, request.page);
     }
     if PAGE_TOOLS.contains(&request.tool.as_str()) {
         return require_page(context, request.page);
@@ -563,11 +576,48 @@ fn session_id_from_path(path: &str) -> Option<String> {
     }
 }
 
-fn scheme_denied(url: &str) -> bool {
-    let trimmed = url.trim().to_ascii_lowercase();
-    trimmed.starts_with("javascript:")
-        || trimmed.starts_with("file:")
-        || trimmed.starts_with("data:")
+/// Managed navigation allowlist.
+///
+/// Trim once, strip one leading `view-source:` wrapper, then allow only
+/// `http:` and `https:` URLs plus the exact URL `about:blank`. The wrapper is
+/// not trimmed again, so `view-source: https://…` stays denied. Standalone
+/// `navigate` does not call this function.
+#[must_use]
+pub fn navigation_url_allowed(url: &str) -> bool {
+    let stripped = strip_one_view_source(url.trim());
+    if stripped == "about:blank" {
+        return true;
+    }
+    let Some(scheme_end) = stripped.find(':') else {
+        return false;
+    };
+    let scheme = stripped[..=scheme_end].to_ascii_lowercase();
+    scheme == "http:" || scheme == "https:"
+}
+
+fn strip_one_view_source(url: &str) -> &str {
+    const WRAPPER: &str = "view-source:";
+    if url.len() >= WRAPPER.len() && url[..WRAPPER.len()].eq_ignore_ascii_case(WRAPPER) {
+        &url[WRAPPER.len()..]
+    } else {
+        url
+    }
+}
+
+/// Page id a managed help request may pin, after the same token and page check
+/// as the pipeline. Callers attach url, title, and tab id only for this page.
+pub fn granted_help_page(
+    runtime: &FreedomRuntime,
+    token: &str,
+    page: Option<u32>,
+) -> Result<u32, CallToolResult> {
+    let context = admit_token(runtime, Some(token).filter(|token| !token.is_empty()))
+        .map_err(|denial| tool_denial(denial.code, denial.message))?;
+    match page {
+        Some(page) if context.allows_page(page) => Ok(page),
+        Some(_) => Err(tool_denial(CODE_SCOPE, MSG_SCOPE)),
+        None => Err(tool_denial(CODE_TARGET, MSG_TARGET)),
+    }
 }
 
 fn is_tabs_list(request: &ToolRequest) -> bool {
@@ -848,5 +898,192 @@ mod tests {
         assert!(text.contains('1'));
         assert!(!text.contains('9'));
         assert_ne!(outcome.result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn finding1_tabs_active_and_new_are_unscoped_before_execute() {
+        let (runtime, secret) = runtime(Scope::pages([1]));
+        for (action, args_url) in [
+            ("active", None),
+            ("new", Some("https://example.com/opened")),
+        ] {
+            let mut request = super::ToolRequest::new("tabs");
+            request.token = Some(secret.clone());
+            request.page = Some(1);
+            request.tabs_action = Some(action.to_string());
+            request.url = args_url.map(str::to_string);
+            let mut called = false;
+            let outcome = run_tool_pipeline(&runtime, request, || {
+                called = true;
+                async { Ok(tool_denial("upstream", "no link to the browser yet")) }
+            })
+            .await;
+            assert!(!called, "{action} reached upstream");
+            let text = text_of(&outcome.result);
+            assert!(text.contains(CODE_UNSCOPED), "{action}: {text}");
+            assert!(
+                !text.contains("no link to the browser"),
+                "{action} executed: {text}"
+            );
+            assert!(!outcome.steps.contains(&STEP_EXECUTE), "{action}");
+        }
+
+        let mut close = super::ToolRequest::new("tabs");
+        close.token = Some(secret);
+        close.page = Some(1);
+        close.tabs_action = Some("close".to_string());
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, close, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "closed")) }
+        })
+        .await;
+        assert!(called, "in-scope close is a scoped mutation");
+        assert!(!text_of(&outcome.result).contains(CODE_UNSCOPED));
+    }
+
+    #[tokio::test]
+    async fn finding2_request_human_help_requires_an_in_scope_page() {
+        let (runtime, secret) = runtime(Scope::pages([1]));
+        let mut missing = super::ToolRequest::new("request_human_help");
+        missing.token = Some(secret.clone());
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, missing, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "pinned the active tab")) }
+        })
+        .await;
+        assert!(!called);
+        assert!(text_of(&outcome.result).contains("freedom_target_required"));
+
+        let mut foreign = super::ToolRequest::new("request_human_help");
+        foreign.token = Some(secret.clone());
+        foreign.page = Some(9);
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, foreign, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "pinned the active tab")) }
+        })
+        .await;
+        assert!(!called);
+        assert!(text_of(&outcome.result).contains("freedom_scope_denied"));
+
+        let mut granted = super::ToolRequest::new("request_human_help");
+        granted.token = Some(secret.clone());
+        granted.page = Some(1);
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, granted, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "handler ran")) }
+        })
+        .await;
+        assert!(called);
+        assert!(text_of(&outcome.result).contains("handler ran"));
+
+        let mut waiting = super::ToolRequest::new("await_human_help");
+        waiting.token = Some(secret);
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, waiting, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "wait")) }
+        })
+        .await;
+        assert!(called);
+        assert!(!text_of(&outcome.result).contains("freedom_target_required"));
+    }
+
+    #[tokio::test]
+    async fn finding3_navigation_allowlist_rejects_wrapped_file_and_chrome() {
+        let allowed = [
+            "https://example.com/a",
+            "http://example.com/a",
+            "  https://example.com/a",
+            "about:blank",
+            "view-source:https://example.com/a",
+            "VIEW-SOURCE:http://example.com/a",
+            "view-source:about:blank",
+            "http:",
+            "https:",
+        ];
+        let denied = [
+            "javascript:alert(1)",
+            "  JaVaScRiPt:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,hi",
+            "view-source:file:///etc/passwd",
+            "VIEW-SOURCE:file:///etc/passwd",
+            "view-source:view-source:https://example.com/a",
+            "view-source: https://example.com/a",
+            "chrome://settings",
+            "chrome:",
+            "ABOUT:BLANK",
+            "about:blank/",
+            "",
+            "   ",
+            "example.com",
+        ];
+        for url in allowed {
+            assert!(
+                super::navigation_url_allowed(url),
+                "expected allow: {url:?}"
+            );
+        }
+        for url in denied {
+            assert!(
+                !super::navigation_url_allowed(url),
+                "expected deny: {url:?}"
+            );
+        }
+
+        let (runtime, secret) = runtime(Scope::pages([1]));
+        for url in [
+            "view-source:file:///etc/passwd",
+            "chrome://settings",
+            "view-source:view-source:https://example.com/a",
+        ] {
+            let mut navigate = super::ToolRequest::new("navigate");
+            navigate.token = Some(secret.clone());
+            navigate.page = Some(1);
+            navigate.url = Some(url.to_string());
+            let mut called = false;
+            let outcome = run_tool_pipeline(&runtime, navigate, || {
+                called = true;
+                async { Ok(tool_denial("upstream", "loaded")) }
+            })
+            .await;
+            assert!(!called, "{url}");
+            assert!(
+                text_of(&outcome.result).contains("freedom_scheme_denied"),
+                "{url}"
+            );
+        }
+
+        let mut blank = super::ToolRequest::new("navigate");
+        blank.token = Some(secret.clone());
+        blank.page = Some(1);
+        blank.url = Some("about:blank".to_string());
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, blank, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "blank")) }
+        })
+        .await;
+        assert!(called);
+        assert!(!text_of(&outcome.result).contains("freedom_scheme_denied"));
+
+        let mut wrapped = super::ToolRequest::new("tabs");
+        wrapped.token = Some(secret);
+        wrapped.tabs_action = Some("new".to_string());
+        wrapped.url = Some("view-source:file:///etc/passwd".to_string());
+        let mut called = false;
+        let outcome = run_tool_pipeline(&runtime, wrapped, || {
+            called = true;
+            async { Ok(tool_denial("upstream", "loaded")) }
+        })
+        .await;
+        assert!(!called);
+        let text = text_of(&outcome.result);
+        assert!(text.contains("freedom_scheme_denied"), "{text}");
+        assert!(!text.contains("freedom_unscoped_read_denied"), "{text}");
     }
 }

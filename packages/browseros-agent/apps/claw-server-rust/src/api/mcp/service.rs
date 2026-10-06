@@ -393,6 +393,8 @@ impl ClawMcpService {
         started: &StartedSession,
         raw_args: &Value,
         request_ct: CancellationToken,
+        freedom_page: Option<u32>,
+        freedom_token: Option<&str>,
     ) -> CallToolResult {
         let Some(reason) = raw_args
             .get("reason")
@@ -412,9 +414,23 @@ impl ClawMcpService {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         };
-        // Pin the tab the agent is on right now, so takeover targets the blocked page even when the
-        // agent has several tabs open and the poll-time attribution later drifts or empties.
-        let (browser_tab_id, url, title) = self.resolve_active_tab(started.session.id()).await;
+        // Standalone still pins the cockpit's most recently active owned tab.
+        // Managed mode pins only the granted page. It does not read the cockpit
+        // or the active tab, including when that page is not currently open.
+        let (browser_tab_id, url, title) = if self.state.freedom.is_managed() {
+            let Some(token) = freedom_token.filter(|token| !token.is_empty()) else {
+                return crate::freedom::tool_denial(
+                    crate::freedom::CODE_CONTEXT_REQUIRED,
+                    "需要已驗證的自由工坊上下文",
+                );
+            };
+            match crate::freedom::granted_help_page(&self.state.freedom, token, freedom_page) {
+                Ok(page) => self.page_metadata(page).await,
+                Err(denial) => return denial,
+            }
+        } else {
+            self.resolve_active_tab(started.session.id()).await
+        };
         let params = HelpOpenParams {
             request_id: format!("help-{}", Ulid::new()),
             reason: reason.to_string(),
@@ -463,6 +479,18 @@ impl ClawMcpService {
             Some(tab) => (Some(tab.browser_tab_id), Some(tab.url), Some(tab.title)),
             None => (None, None, None),
         }
+    }
+
+    /// Url, title, and browser tab id for one granted page. Missing pages and a
+    /// missing browser session attach nothing. There is no active-tab fallback.
+    async fn page_metadata(&self, page: u32) -> (Option<i64>, Option<String>, Option<String>) {
+        let Some(browser) = self.state.browser.session().await else {
+            return (None, None, None);
+        };
+        let Some(info) = browser.pages.get_info(browseros_core::PageId(page)).await else {
+            return (None, None, None);
+        };
+        (Some(info.tab_id.0), Some(info.url), Some(info.title))
     }
 
     async fn call_await_human_help(
@@ -1043,8 +1071,14 @@ impl ServerHandler for ClawMcpService {
                 } else if is_mark_skill_run {
                     self.call_mark_skill_run(&started, &raw_args).await
                 } else if is_request_help {
-                    self.call_request_human_help(&started, &raw_args, context.ct.clone())
-                        .await
+                    self.call_request_human_help(
+                        &started,
+                        &raw_args,
+                        context.ct.clone(),
+                        freedom_page,
+                        freedom_token.as_deref(),
+                    )
+                    .await
                 } else {
                     self.call_await_human_help(&started, context.ct.clone())
                         .await
@@ -1061,7 +1095,7 @@ impl ServerHandler for ClawMcpService {
             Ok(self.call_mark_skill_run(&started, &raw_args).await)
         } else if is_request_help {
             Ok(self
-                .call_request_human_help(&started, &raw_args, context.ct.clone())
+                .call_request_human_help(&started, &raw_args, context.ct.clone(), None, None)
                 .await)
         } else if is_await_help {
             Ok(self
@@ -2432,7 +2466,7 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
 
         let result = service
-            .call_request_human_help(&started, &json!({}), CancellationToken::new())
+            .call_request_human_help(&started, &json!({}), CancellationToken::new(), None, None)
             .await;
 
         assert_eq!(result.is_error, Some(true));
@@ -2869,6 +2903,153 @@ mod tests {
             rename_session(None, &json!({ "name": "invoice processing" })).await,
             Err("unable to resolve this session")
         );
+        Ok(())
+    }
+
+    struct TwoTabConnection {
+        events: tokio::sync::broadcast::Sender<browseros_cdp::CdpEvent>,
+    }
+
+    impl TwoTabConnection {
+        fn new() -> Arc<Self> {
+            let (events, _) = tokio::sync::broadcast::channel(1);
+            Arc::new(Self { events })
+        }
+    }
+
+    impl browseros_core::CdpConnection for TwoTabConnection {
+        fn send<'a>(
+            &'a self,
+            method: &'a str,
+            _params: Value,
+            _session: Option<&'a browseros_cdp::SessionId>,
+        ) -> futures_util::future::BoxFuture<'a, Result<Value, browseros_cdp::CdpError>> {
+            Box::pin(async move {
+                let granted = json!({
+                    "tabId": 11,
+                    "targetId": "target-granted",
+                    "url": "https://granted.example/in-scope",
+                    "title": "Granted page",
+                    "isActive": false,
+                    "isLoading": false,
+                    "loadProgress": 1.0,
+                    "isPinned": false,
+                    "isHidden": false,
+                    "windowId": 1,
+                    "index": 0
+                });
+                let human = json!({
+                    "tabId": 99,
+                    "targetId": "target-human",
+                    "url": "https://human.example/secret",
+                    "title": "Human tab",
+                    "isActive": true,
+                    "isLoading": false,
+                    "loadProgress": 1.0,
+                    "isPinned": false,
+                    "isHidden": false,
+                    "windowId": 1,
+                    "index": 1
+                });
+                match method {
+                    "Browser.getTabs" => Ok(json!({ "tabs": [granted, human] })),
+                    "Browser.getActiveTab" => Ok(json!({ "tab": human })),
+                    _ => Ok(json!({})),
+                }
+            })
+        }
+
+        fn send_raw_json<'a>(
+            &'a self,
+            _method: &'a str,
+            _params_json: &'a str,
+            _session: Option<&'a browseros_cdp::SessionId>,
+        ) -> futures_util::future::BoxFuture<'a, Result<String, browseros_cdp::CdpError>> {
+            Box::pin(async { Ok("{}".to_string()) })
+        }
+
+        fn events(&self) -> tokio::sync::broadcast::Receiver<browseros_cdp::CdpEvent> {
+            self.events.subscribe()
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn connection_epoch(&self) -> u64 {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn finding2_managed_help_pins_the_granted_page_not_the_human_tab() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("home");
+        let profile = dir.path().join("managed");
+        let standalone = dir.path().join("standalone");
+        tokio::fs::create_dir_all(&home).await?;
+        let mut bytes = [0_u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        let secret: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let mut verifier = crate::freedom::InProcessVerifier::new();
+        let (auth, attempt) = crate::freedom::BoundAttempt::matching_pair(
+            "alice",
+            "attempt-1",
+            crate::freedom::Scope::pages([1]),
+        );
+        verifier.insert(secret.clone(), auth, attempt);
+        let state = crate::AppState::new_managed_with_home(
+            Arc::new(crate::config::Config {
+                server_port: 9200,
+                cdp_port: 49337,
+                proxy_port: None,
+                resources_dir: profile.join("resources"),
+                browserclaw_dir: profile,
+                session_idle: std::time::Duration::from_secs(300),
+                session_retention: std::time::Duration::from_secs(7_200),
+                session_sweep_interval: std::time::Duration::from_secs(60),
+                replay_retention_days: 7,
+                dev_mode: false,
+            }),
+            home,
+            standalone,
+            Arc::new(verifier),
+        )
+        .await?;
+        let browser = browseros_core::BrowserSession::new(
+            TwoTabConnection::new(),
+            browseros_core::BrowserSessionHooks::default(),
+        );
+        browser.pages.list().await?;
+        state.browser.set_session_for_testing(browser).await;
+        let service = ClawMcpService::new(state.clone());
+        let started = service
+            .ensure_session_started(SessionId::new("mcp-help-granted"))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let request_ct = CancellationToken::new();
+        request_ct.cancel();
+        let result = service
+            .call_request_human_help(
+                &started,
+                &json!({ "reason": "need a code" }),
+                request_ct,
+                Some(1),
+                Some(secret.as_str()),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+        let view = state
+            .help
+            .snapshot(started.session.id(), None, None, None)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("help request was not pinned to a tab"))?;
+        assert_eq!(view.browser_tab_id, 11);
+        assert_eq!(
+            view.url.as_deref(),
+            Some("https://granted.example/in-scope")
+        );
+        assert_eq!(view.title.as_deref(), Some("Granted page"));
         Ok(())
     }
 }

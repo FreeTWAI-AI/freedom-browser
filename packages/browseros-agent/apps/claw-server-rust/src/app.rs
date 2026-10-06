@@ -95,7 +95,7 @@ impl AppState {
         standalone_dir: PathBuf,
         verifier: Arc<dyn FreedomVerifier>,
     ) -> AppResult<Self> {
-        crate::freedom::ensure_distinct(&config.browserclaw_dir, &standalone_dir)
+        crate::freedom::bind_distinct_profiles(&config.browserclaw_dir, &standalone_dir)
             .map_err(|error| AppError::Internal(error.to_string()))?;
         tokio::fs::create_dir_all(&config.browserclaw_dir).await?;
         crate::freedom::write_managed_marker(&config.browserclaw_dir).await?;

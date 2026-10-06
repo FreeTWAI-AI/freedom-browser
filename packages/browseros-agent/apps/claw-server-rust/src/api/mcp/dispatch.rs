@@ -272,15 +272,24 @@ pub async fn dispatch_tool_call(call: ToolCall) -> Result<CallToolResult, McpErr
 }
 
 async fn dispatch_managed(call: ToolCall) -> Result<CallToolResult, McpError> {
+    // `dispatch_tool_call_with` cancels `call.cancel` on every return, so that
+    // token is not a pipeline signal. The client token and the operator stop
+    // flag are. Result text is not scanned.
+    let client_cancel = call.client_cancel.clone();
+    let session = call
+        .identity
+        .as_ref()
+        .map(|identity| Arc::clone(&identity.session));
     let request = freedom_request_from_call(&call);
-    // `dispatch_tool_call_with` cancels its own tokens when the call returns.
-    // That cleanup is not an operator cancel. The pipeline watches this gate,
-    // and the closure trips it only when the upstream result is a real cancel.
     let gate = request.cancel.clone();
     let runtime = Arc::clone(&call.state.freedom);
     let outcome = crate::freedom::run_tool_pipeline(&runtime, request, || async move {
         let result = dispatch_tool_call_with(call, GUARDS, EFFECTS, OBSERVERS).await;
-        if result_is_cancellation(&result) {
+        if client_cancel.is_cancelled()
+            || session
+                .as_ref()
+                .is_some_and(|live| live.operator_stop_requested())
+        {
             gate.cancel();
         }
         result
@@ -327,16 +336,6 @@ fn freedom_request_from_call(call: &ToolCall) -> crate::freedom::ToolRequest {
         url,
         tabs_action,
         cancel,
-    }
-}
-
-fn result_is_cancellation(result: &Result<CallToolResult, McpError>) -> bool {
-    match result {
-        Err(error) => error.to_string().contains(CLIENT_CANCELLATION_ERROR),
-        Ok(result) => result.content.iter().any(|block| match block {
-            ContentBlock::Text(text) => text.text.contains(CANCELLATION_REASON),
-            _ => false,
-        }),
     }
 }
 
