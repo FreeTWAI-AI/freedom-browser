@@ -580,8 +580,10 @@ fn session_id_from_path(path: &str) -> Option<String> {
 ///
 /// Trim once, strip one leading `view-source:` wrapper, then allow only
 /// `http:` and `https:` URLs plus the exact URL `about:blank`. The wrapper is
-/// not trimmed again, so `view-source: https://…` stays denied. Standalone
-/// `navigate` does not call this function.
+/// matched only when those bytes are a character boundary, so a multibyte URL
+/// is never sliced mid-character. The wrapper is not trimmed again, so
+/// `view-source: https://…` stays denied. Standalone `navigate` does not call
+/// this function.
 #[must_use]
 pub fn navigation_url_allowed(url: &str) -> bool {
     let stripped = strip_one_view_source(url.trim());
@@ -591,16 +593,16 @@ pub fn navigation_url_allowed(url: &str) -> bool {
     let Some(scheme_end) = stripped.find(':') else {
         return false;
     };
+    // `:` is one ASCII byte, so this end is a character boundary.
     let scheme = stripped[..=scheme_end].to_ascii_lowercase();
     scheme == "http:" || scheme == "https:"
 }
 
 fn strip_one_view_source(url: &str) -> &str {
     const WRAPPER: &str = "view-source:";
-    if url.len() >= WRAPPER.len() && url[..WRAPPER.len()].eq_ignore_ascii_case(WRAPPER) {
-        &url[WRAPPER.len()..]
-    } else {
-        url
+    match url.get(..WRAPPER.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(WRAPPER) => &url[WRAPPER.len()..],
+        _ => url,
     }
 }
 
@@ -1085,5 +1087,70 @@ mod tests {
         let text = text_of(&outcome.result);
         assert!(text.contains("freedom_scheme_denied"), "{text}");
         assert!(!text.contains("freedom_unscoped_read_denied"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn non_ascii_navigation_urls_use_the_admit_path() {
+        let (runtime, secret) = runtime(Scope::pages([1]));
+        for url in [
+            "https://例子.com/",
+            "https://日本.jp/",
+            "HTTPS://例子.com/",
+            "view-source:https://例子.com/",
+        ] {
+            let mut navigate = super::ToolRequest::new("navigate");
+            navigate.token = Some(secret.clone());
+            navigate.page = Some(1);
+            navigate.url = Some(url.to_string());
+            let mut called = false;
+            let outcome = run_tool_pipeline(&runtime, navigate, || {
+                called = true;
+                async { Ok(tool_denial("upstream", "loaded")) }
+            })
+            .await;
+            assert!(called, "{url}");
+            assert!(
+                !text_of(&outcome.result).contains("freedom_scheme_denied"),
+                "{url}: {}",
+                text_of(&outcome.result)
+            );
+        }
+        for url in ["view-source:file:///例", "例子:foo", "javascript:例"] {
+            let mut navigate = super::ToolRequest::new("navigate");
+            navigate.token = Some(secret.clone());
+            navigate.page = Some(1);
+            navigate.url = Some(url.to_string());
+            let mut called = false;
+            let outcome = run_tool_pipeline(&runtime, navigate, || {
+                called = true;
+                async { Ok(tool_denial("upstream", "loaded")) }
+            })
+            .await;
+            assert!(!called, "{url}");
+            assert!(
+                text_of(&outcome.result).contains("freedom_scheme_denied"),
+                "{url}: {}",
+                text_of(&outcome.result)
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_url_allowed_survives_multibyte_prefixes_and_suffixes() {
+        for url in [
+            "https://例子.com/",
+            "https://日本.jp/",
+            "view-source:https://例子.com/",
+        ] {
+            let mut bounds = vec![0];
+            bounds.extend(url.char_indices().map(|(index, _)| index));
+            bounds.push(url.len());
+            for end in &bounds {
+                let _ = super::navigation_url_allowed(&url[..*end]);
+            }
+            for start in &bounds {
+                let _ = super::navigation_url_allowed(&url[*start..]);
+            }
+        }
     }
 }

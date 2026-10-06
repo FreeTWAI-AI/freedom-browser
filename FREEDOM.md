@@ -22,12 +22,15 @@ behavior: local MCP and HTTP routes are not gated by a Freedom run context.
 Managed mode is chosen only when the process starts, by `--freedom-managed`
 together with `--freedom-profile <dir>`, or by the sidecar `freedom` object.
 The managed profile must be a different directory from the standalone default
-(`~/.browserclaw`, or `~/.browserclaw-dev` when dev mode is on). The process
-creates that directory, resolves both paths with `std::fs::canonicalize`
-(a missing tail is rebuilt from the deepest existing ancestor; any other
-resolution failure refuses startup), and rejects a profile that equals,
-contains, or sits inside the standalone tree after symlink resolution, in
-either direction. It then writes `freedom-managed-profile.json`. If that
+(`~/.browserclaw`, or `~/.browserclaw-dev` when dev mode is on). Startup
+resolves each path as given, with `std::fs::canonicalize`, and does not
+remove `..` lexically before that call. A missing tail uses the deepest
+existing ancestor of the path as given, then the remaining components. A
+`..` that is still in that missing tail refuses startup. Any other
+resolution failure refuses startup too. The process rejects a profile that
+equals, contains, or sits inside the standalone tree after that resolution,
+in either direction. It creates the directory and writes
+`freedom-managed-profile.json` on that same resolved path. If that
 marker file exists, the directory is managed even when the bytes are not
 valid JSON. An unreadable marker is an error. Only a missing file is
 standalone. A later standalone start refuses to open a marked directory.
@@ -55,11 +58,13 @@ cockpit's active tab. Standalone still pins the session's most recently
 active owned tab.
 
 Managed navigation URLs are an allowlist. The check trims the argument,
-strips one leading `view-source:` wrapper, and then allows only `http:` and
-`https:` URLs and the exact URL `about:blank`. It covers every tool argument
-that carries a navigation URL, including `navigate` and `tabs` `new`.
-Standalone `navigate` keeps the upstream scheme refusal and its English
-error text.
+strips one leading `view-source:` wrapper when that prefix falls on a
+character boundary, and then allows only `http:` and `https:` URLs and the
+exact URL `about:blank`. The decision for ASCII inputs is unchanged. A
+non-ASCII URL is allowed or denied the same way and does not panic. It
+covers every tool argument that carries a navigation URL, including
+`navigate` and `tabs` `new`. Standalone `navigate` keeps the upstream
+scheme refusal and its English error text.
 
 This client does not mark a Freedom business effect as accepted. Cancellation
 uses the client cancel token and the operator stop flag. Result text and
@@ -85,4 +90,4 @@ The AGPL-3.0-or-later obligations that are visible from this tree:
 
 ## 自由工坊（摘要）
 
-這是 BrowserOS 的公開分叉，授權為 AGPL-3.0-or-later。預設是獨立模式，行為與上游相同。受管理模式只能在行程啟動時選定，使用另外的資料目錄，執行中不能透過設定或 MCP 放寬。沒有自由工坊上下文時，讀取與操作都會被拒絕，不會退回上游的未限制路徑。分頁 `active` 與 `new` 會被拒絕；`close` 仍需要範圍內的分頁。請求人工協助必須指定本次連接範圍內的分頁，不會改釘在目前作用中的分頁。網址只允許 `http`、`https` 與 `about:blank`。取消以用戶端的取消訊號與操作者的停止要求為準，不依結果文字判斷。任意程式碼執行在受管理模式被拒絕。本機 `/freedom/v1` 只聽 `127.0.0.1`。目前沒有自由工坊的正式發行、簽章或商店上架。
+這是 BrowserOS 的公開分叉，授權為 AGPL-3.0-or-later。預設是獨立模式，行為與上游相同。受管理模式只能在行程啟動時選定，使用另外的資料目錄（路徑照檔案系統解析，不先消掉 `..`），執行中不能透過設定或 MCP 放寬。沒有自由工坊上下文時，讀取與操作都會被拒絕，不會退回上游的未限制路徑。分頁 `active` 與 `new` 會被拒絕；`close` 仍需要範圍內的分頁。請求人工協助必須指定本次連接範圍內的分頁，不會改釘在目前作用中的分頁。網址只允許 `http`、`https` 與 `about:blank`，檢查不會因非 ASCII 字元中斷。取消以用戶端的取消訊號與操作者的停止要求為準，不依結果文字判斷。任意程式碼執行在受管理模式被拒絕。本機 `/freedom/v1` 只聽 `127.0.0.1`。目前沒有自由工坊的正式發行、簽章或商店上架。

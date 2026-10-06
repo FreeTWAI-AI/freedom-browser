@@ -65,7 +65,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/app.rs",
       "status": "modified",
-      "purpose": "Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and binds a managed state only after the profile resolves to a distinct directory."
+      "purpose": "Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and writes the managed marker only on the resolved distinct profile directory."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/config.rs",
@@ -80,7 +80,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/guard.rs",
       "status": "new",
-      "purpose": "Managed-mode pipeline. tabs active and new are unscoped, request_human_help needs an in-scope page, and navigation URLs are an http(s) or about:blank allowlist."
+      "purpose": "Managed-mode pipeline. tabs active and new are unscoped, request_human_help needs an in-scope page, and navigation URLs are an http(s) or about:blank allowlist. The view-source prefix is matched on a character boundary."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/local_api.rs",
@@ -95,7 +95,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/mode.rs",
       "status": "new",
-      "purpose": "Resolves managed versus standalone from the CLI and sidecar. An existing marker file is managed. Profiles are compared after canonicalization."
+      "purpose": "Resolves managed versus standalone from the CLI and sidecar. An existing marker file is managed. Profile paths are canonicalized as given, without a lexical .. pop; a .. left in a missing tail fails closed."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/registry.rs",
@@ -110,7 +110,7 @@
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/src/main.rs",
       "status": "modified",
-      "purpose": "Selects managed mode only at process start, binds 127.0.0.1, and publishes the bound port for the Host allowlist."
+      "purpose": "Selects managed mode only at process start, resolves the managed profile before creating logs, binds 127.0.0.1, and publishes the bound port for the Host allowlist."
     },
     {
       "path": "packages/browseros-agent/apps/claw-server-rust/tests/dependency_boundaries.rs",
