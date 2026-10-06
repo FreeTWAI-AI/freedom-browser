@@ -75,6 +75,18 @@ const MARK_SKILL_RUN_DESCRIPTION: &str = "Mark this browser session as a run of 
 const REQUEST_HELP_TOOL_NAME: &str = "request_human_help";
 const REQUEST_HELP_DESCRIPTION: &str = "Ask a human to take over this page when you hit something only a person can do: a sign-in, a one-time code, a captcha, an account choice, or an approval you should not make yourself. Give a short `reason` (what you need), optional `details` (what the human should know), an optional `resumeHint` (what you will do after, so the human knows the task continues), and an optional `kind` (login, captcha, approval, other). This blocks for a short while and returns a status. If the status is \"waiting\", call await_human_help to keep waiting; do nothing else on the page until the status is \"resolved\". The cockpit shows your request so a human can take over the tab and hand control back.";
 const AWAIT_HELP_TOOL_NAME: &str = "await_human_help";
+
+/// Server-local MCP tools. These are not in `browseros_mcp::catalog`.
+#[must_use]
+pub fn server_tool_names() -> [&'static str; 5] {
+    [
+        NAME_SESSION_TOOL_NAME,
+        SAVE_SKILL_TOOL_NAME,
+        MARK_SKILL_RUN_TOOL_NAME,
+        REQUEST_HELP_TOOL_NAME,
+        AWAIT_HELP_TOOL_NAME,
+    ]
+}
 const AWAIT_HELP_DESCRIPTION: &str = "Keep waiting on an open human-help request. Call this repeatedly after request_human_help until the status is \"resolved\" (the human handed control back), \"cancelled\" (the run was stopped), or \"timed_out\" (no human responded in time). Do nothing else on the page while waiting.";
 /// How long each wait call blocks before returning a `waiting` status. Short enough to stay under
 /// any reasonable client tool-call timeout so an agent that cannot hold a long call just re-calls.
@@ -900,6 +912,47 @@ impl ServerHandler for ClawMcpService {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // Freedom precheck runs before session resolution. A label is parsed
+        // and ignored. Server-local tools never reach `dispatch_tool_call`.
+        let freedom_token = freedom_bearer(&context.extensions);
+        let presented_label = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get(AGENT_NAME_ARG))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let freedom_page = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("page"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value >= 1);
+        let freedom_url = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let freedom_tabs_action = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("action"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(denial) = crate::freedom::precheck_mcp_tool(
+            &self.state.freedom,
+            request.name.as_ref(),
+            freedom_token.as_deref(),
+            presented_label.as_deref(),
+            freedom_page,
+            freedom_url.as_deref(),
+            freedom_tabs_action.as_deref(),
+        ) {
+            return Ok(denial.into());
+        }
         let is_name_session = request.name == NAME_SESSION_TOOL_NAME;
         let is_save_skill = request.name == SAVE_SKILL_TOOL_NAME;
         let is_mark_skill_run = request.name == MARK_SKILL_RUN_TOOL_NAME;
@@ -964,7 +1017,43 @@ impl ServerHandler for ClawMcpService {
         let tool_started_at = tokio::time::Instant::now();
         let tool_name = request.name.to_string();
 
-        let result = if is_name_session {
+        let server_local = is_name_session
+            || is_save_skill
+            || is_mark_skill_run
+            || is_request_help
+            || is_await_help;
+        // Catalog tools run the eight-step pipeline inside `dispatch_tool_call`.
+        // Server-local tools never reach that function, so managed mode runs the
+        // same pipeline around their handlers. Transport session setup above is
+        // not a page effect; begin still happens before the handler.
+        let result = if self.state.freedom.is_managed() && server_local {
+            let mut guarded = crate::freedom::ToolRequest::new(tool_name.clone());
+            guarded.token = freedom_token.clone();
+            guarded.session_label = presented_label.clone();
+            guarded.page = freedom_page;
+            guarded.url = freedom_url.clone();
+            guarded.tabs_action = freedom_tabs_action.clone();
+            guarded.cancel = context.ct.clone();
+            let runtime = std::sync::Arc::clone(&self.state.freedom);
+            let outcome = crate::freedom::run_tool_pipeline(&runtime, guarded, || async {
+                let inner = if is_name_session {
+                    self.call_name_session(&started, &raw_args).await
+                } else if is_save_skill {
+                    self.call_save_skill(&started, &raw_args).await
+                } else if is_mark_skill_run {
+                    self.call_mark_skill_run(&started, &raw_args).await
+                } else if is_request_help {
+                    self.call_request_human_help(&started, &raw_args, context.ct.clone())
+                        .await
+                } else {
+                    self.call_await_human_help(&started, context.ct.clone())
+                        .await
+                };
+                Ok(inner)
+            })
+            .await;
+            Ok(outcome.result)
+        } else if is_name_session {
             Ok(self.call_name_session(&started, &raw_args).await)
         } else if is_save_skill {
             Ok(self.call_save_skill(&started, &raw_args).await)
@@ -1002,7 +1091,7 @@ impl ServerHandler for ClawMcpService {
                 ownership_key,
                 agent_label: started.agent_label,
             };
-            let call = ToolCall::new(
+            let mut call = ToolCall::new(
                 self.catalog.clone(),
                 tool_index,
                 raw_args,
@@ -1016,6 +1105,7 @@ impl ServerHandler for ClawMcpService {
                 self.state.clone(),
                 self.output_files.clone(),
             );
+            call.set_freedom_auth(freedom_token.clone(), presented_label.clone());
             dispatch_tool_call(call).await
         };
 
@@ -1539,6 +1629,21 @@ fn attach_session_handle(
             .push(rmcp::model::ContentBlock::text(line));
         call_result
     })
+}
+
+fn freedom_bearer(extensions: &rmcp::model::Extensions) -> Option<String> {
+    let value = extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
+        .and_then(|value| value.to_str().ok())?;
+    let mut parts = value.trim().splitn(2, char::is_whitespace);
+    let scheme = parts.next()?.trim();
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && token.len() <= 512 {
+        Some(token.to_string())
+    } else {
+        None
+    }
 }
 
 fn session_id_from_extensions(extensions: &rmcp::model::Extensions) -> Option<SessionId> {

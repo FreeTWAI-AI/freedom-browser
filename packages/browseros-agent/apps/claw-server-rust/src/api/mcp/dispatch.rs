@@ -65,6 +65,11 @@ pub struct ToolCall {
     pub state: AppState,
     pub dispatch_id: DispatchId,
     pub output_files: OutputFileAccess,
+    /// Presented Freedom bearer. Absent in standalone and on an unauthenticated call.
+    /// A session label is never stored here as a substitute.
+    freedom_token: Option<String>,
+    /// Client-provided name or MCP session label. Never used as identity.
+    presented_session_label: Option<String>,
     /// Pages a `run` script acted on that belong to the user or another agent.
     ///
     /// `run` has no top-level `page` argument, so the ownership notice cannot be derived
@@ -117,6 +122,8 @@ impl ToolCall {
         };
         Self {
             foreign_pages: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            freedom_token: None,
+            presented_session_label: None,
             catalog,
             tool_index,
             raw_args,
@@ -134,6 +141,12 @@ impl ToolCall {
             dispatch_id: DispatchId::new(),
             output_files,
         }
+    }
+
+    /// Attaches a bearer and a presented label. The label is not a credential.
+    pub fn set_freedom_auth(&mut self, token: Option<String>, label: Option<String>) {
+        self.freedom_token = token;
+        self.presented_session_label = label;
     }
 
     #[must_use]
@@ -248,8 +261,83 @@ enum DispatchExecution {
 }
 
 /// Dispatches a tool through guards, execution, ordered effects, and read-only observers.
+///
+/// Freedom managed mode screens the call before the upstream path. A denial
+/// drops the execute closure without polling it.
 pub async fn dispatch_tool_call(call: ToolCall) -> Result<CallToolResult, McpError> {
+    if call.state.freedom.is_managed() {
+        return dispatch_managed(call).await;
+    }
     dispatch_tool_call_with(call, GUARDS, EFFECTS, OBSERVERS).await
+}
+
+async fn dispatch_managed(call: ToolCall) -> Result<CallToolResult, McpError> {
+    let request = freedom_request_from_call(&call);
+    // `dispatch_tool_call_with` cancels its own tokens when the call returns.
+    // That cleanup is not an operator cancel. The pipeline watches this gate,
+    // and the closure trips it only when the upstream result is a real cancel.
+    let gate = request.cancel.clone();
+    let runtime = Arc::clone(&call.state.freedom);
+    let outcome = crate::freedom::run_tool_pipeline(&runtime, request, || async move {
+        let result = dispatch_tool_call_with(call, GUARDS, EFFECTS, OBSERVERS).await;
+        if result_is_cancellation(&result) {
+            gate.cancel();
+        }
+        result
+    })
+    .await;
+    Ok(outcome.result)
+}
+
+fn freedom_request_from_call(call: &ToolCall) -> crate::freedom::ToolRequest {
+    let tool = call.tool().name.to_string();
+    let tabs_action = if tool == "tabs" {
+        call.raw_args
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let url = call
+        .raw_args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let label = call.presented_session_label.clone().or_else(|| {
+        call.identity
+            .as_ref()
+            .map(|identity| identity.agent_label.clone())
+    });
+    if call.cancel.is_cancelled() || call.client_cancel.is_cancelled() {
+        call.dispatch_cancel.cancel();
+    }
+    let cancel = CancellationToken::new();
+    if call.dispatch_cancel.is_cancelled()
+        || call.cancel.is_cancelled()
+        || call.client_cancel.is_cancelled()
+    {
+        cancel.cancel();
+    }
+    crate::freedom::ToolRequest {
+        tool,
+        token: call.freedom_token.clone(),
+        session_label: label,
+        page: extract_page_id(call),
+        url,
+        tabs_action,
+        cancel,
+    }
+}
+
+fn result_is_cancellation(result: &Result<CallToolResult, McpError>) -> bool {
+    match result {
+        Err(error) => error.to_string().contains(CLIENT_CANCELLATION_ERROR),
+        Ok(result) => result.content.iter().any(|block| match block {
+            ContentBlock::Text(text) => text.text.contains(CANCELLATION_REASON),
+            _ => false,
+        }),
+    }
 }
 
 async fn dispatch_tool_call_with(
@@ -410,6 +498,18 @@ async fn run_observers(context: ToolObserverContext<'_>, observers: &[NamedToolO
 
 async fn execute_with_cancellation(call: &ToolCall) -> DispatchExecution {
     let started = Instant::now();
+    // Freedom: raw execution is denied again here so a direct upstream call
+    // cannot install the script hook or preload helpers.
+    if call.state.freedom.is_managed() && ARBITRARY_SCRIPT_TOOLS.contains(&call.tool().name) {
+        return DispatchExecution::Completed(ExecutionOutcome {
+            result: ToolResult::error(format!(
+                "{}: 受管理的執行環境拒絕任意程式碼",
+                crate::freedom::CODE_RAW_EXEC
+            )),
+            cancelled: false,
+            duration_ms: 0,
+        });
+    }
     if call.dispatch_cancel.is_cancelled() {
         return DispatchExecution::Completed(ExecutionOutcome {
             result: operator_cancellation_result(),

@@ -24,6 +24,7 @@ pub use service::ClawMcpService;
 // Re-exported so the route tests assert against the real text instead of keeping a
 // copy of it, which is what let the two drift apart.
 pub use service::SESSION_ARG_DESCRIPTION;
+pub use service::server_tool_names;
 
 /// Builds the shared MCP service used by both streamable HTTP and stdio.
 #[must_use]
