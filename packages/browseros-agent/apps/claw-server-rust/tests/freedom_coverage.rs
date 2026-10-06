@@ -38,7 +38,7 @@ use std::{
     time::Duration,
 };
 use syn::{
-    Expr, ExprCall, ExprLit, ExprMethodCall, Lit,
+    Expr, ExprCall, ExprLit, ExprMethodCall, FnArg, ImplItemFn, ItemFn, ItemImpl, Lit, Pat,
     visit::{self, Visit},
 };
 use tokio_util::sync::CancellationToken;
@@ -76,6 +76,105 @@ fn slice_fn<'a>(source: &'a str, name: &str) -> &'a str {
     match next {
         Some(end) => &source[start..start + marker.len() + end],
         None => &source[start..],
+    }
+}
+
+fn discovered_native_ids() -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    discover_native_dir(&manifest_path("src"), &mut found);
+    assert!(
+        !found.is_empty(),
+        "native entry discovery found no script or helper runtime"
+    );
+    found
+}
+
+fn discover_native_dir(dir: &Path, found: &mut BTreeSet<String>) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            discover_native_dir(&path, found);
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let file = syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let mut visitor = NativeEntryVisitor::default();
+        visitor.visit_file(&file);
+        if visitor.hit {
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_else(|| panic!("native entry {} has no file stem", path.display()));
+            found.insert(stem.to_string());
+        }
+    }
+}
+
+#[derive(Default)]
+struct NativeEntryVisitor {
+    hit: bool,
+    in_inner_hook: bool,
+}
+
+impl<'ast> Visit<'ast> for NativeEntryVisitor {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        if node.sig.ident == "execute_nested" {
+            self.hit = true;
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        let previous = self.in_inner_hook;
+        self.in_inner_hook = impl_trait_is(node, "InnerCallHook");
+        visit::visit_item_impl(self, node);
+        self.in_inner_hook = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        if self.in_inner_hook && method_runs_script_or_helper_source(node) {
+            self.hit = true;
+        }
+        visit::visit_impl_item_fn(self, node);
+    }
+}
+
+fn impl_trait_is(node: &ItemImpl, name: &str) -> bool {
+    node.trait_
+        .as_ref()
+        .and_then(|(_, path, _)| path.segments.last())
+        .is_some_and(|segment| segment.ident == name)
+}
+
+fn method_runs_script_or_helper_source(node: &ImplItemFn) -> bool {
+    let name = node.sig.ident.to_string();
+    if name == "read_helper" || name == "save_helper" {
+        return true;
+    }
+    node.sig.inputs.iter().any(arg_is_named_source)
+}
+
+fn arg_is_named_source(arg: &FnArg) -> bool {
+    let FnArg::Typed(typed) = arg else {
+        return false;
+    };
+    pat_is_named_source(&typed.pat)
+}
+
+fn pat_is_named_source(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(ident) => ident.ident == "source",
+        Pat::Type(inner) => pat_is_named_source(&inner.pat),
+        Pat::Reference(inner) => pat_is_named_source(&inner.pat),
+        _ => false,
     }
 }
 
@@ -263,10 +362,9 @@ fn neo08_registry_matches_the_router_catalog_and_native_entries() {
         "mcp registry drift\nmissing: {missing_mcp:?}\nstale: {stale_mcp:?}"
     );
 
-    let native: BTreeSet<String> = ["script_hook", "helper_runtime"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let native = discovered_native_ids();
+    assert!(native.contains("script_hook"), "{native:?}");
+    assert!(native.contains("helper_runtime"), "{native:?}");
     assert_eq!(registry_ids("native:"), native);
 
     let dispatch = read_source("src/api/mcp/dispatch.rs");
@@ -526,36 +624,56 @@ async fn neo08_every_raw_exec_surface_is_denied_on_the_dispatch_path() -> anyhow
             assert_tool_denied(&missing, CODE_CONTEXT_REQUIRED);
             let direct = dispatch_named(&state, name, Some(token.clone())).await?;
             assert_tool_denied(&direct, CODE_RAW_EXEC);
+        } else if let Some(name) = entry.id.strip_prefix("native:") {
+            deny_native(&state, name).await?;
+        } else {
+            panic!("no dispatch probe for {}", entry.id);
         }
     }
-    let nested =
-        execute_nested(&state, "pages.list()").map_or_else(|error| error, |_| String::new());
-    assert!(nested.contains(CODE_RAW_EXEC), "{nested}");
-    let catalog = Arc::new(browseros_mcp::catalog());
-    let tool_index = catalog
-        .iter()
-        .position(|entry| entry.name == "run")
-        .ok_or_else(|| anyhow::anyhow!("missing run"))?;
-    let call = ToolCall::new(
-        catalog,
-        tool_index,
-        serde_json::json!({}),
-        SessionId::new("s1"),
-        None,
-        None,
-        CancellationToken::new(),
-        CancellationToken::new(),
-        CancellationToken::new(),
-        None,
-        state,
-        browseros_mcp::output_file::create_browser_output_file_access(),
-    );
-    let hook = ScriptInnerCallHook::new(call);
-    let hook_error = hook
-        .authorize(Some(1))
-        .await
-        .map_or_else(|error| error, |_| String::new());
-    assert!(hook_error.contains(CODE_RAW_EXEC), "{hook_error}");
+    Ok(())
+}
+
+async fn deny_native(state: &AppState, name: &str) -> anyhow::Result<()> {
+    match name {
+        "helper_runtime" => {
+            let nested =
+                execute_nested(state, "pages.list()").map_or_else(|error| error, |_| String::new());
+            assert!(nested.contains(CODE_RAW_EXEC), "{nested}");
+        }
+        "script_hook" => {
+            let catalog = Arc::new(browseros_mcp::catalog());
+            let tool_index = catalog
+                .iter()
+                .position(|entry| entry.name == "run")
+                .ok_or_else(|| anyhow::anyhow!("missing run"))?;
+            let call = ToolCall::new(
+                catalog,
+                tool_index,
+                serde_json::json!({}),
+                SessionId::new("s1"),
+                None,
+                None,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                None,
+                state.clone(),
+                browseros_mcp::output_file::create_browser_output_file_access(),
+            );
+            let hook = ScriptInnerCallHook::new(call);
+            let hook_error = hook
+                .authorize(Some(1))
+                .await
+                .map_or_else(|error| error, |_| String::new());
+            assert!(hook_error.contains(CODE_RAW_EXEC), "{hook_error}");
+            let leaked = hook.read_helper("example.com", "secret-helper").await;
+            assert!(
+                leaked.is_none(),
+                "managed read_helper returned source: {leaked:?}"
+            );
+        }
+        other => panic!("no dispatch probe for native:{other}"),
+    }
     Ok(())
 }
 
