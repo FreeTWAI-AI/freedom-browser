@@ -40,6 +40,14 @@ impl ScriptInnerCallHook {
 impl InnerCallHook for ScriptInnerCallHook {
     fn authorize<'a>(&'a self, page: Option<u32>) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            // Freedom managed mode refuses nested script primitives. Standalone
+            // still treats ownership as a notice, not a permission.
+            if self.call.state.freedom.is_managed() {
+                return Err(format!(
+                    "{}: 受管理的執行環境拒絕任意程式碼",
+                    crate::freedom::CODE_RAW_EXEC
+                ));
+            }
             let Some(page) = page else {
                 return Ok(());
             };
@@ -99,6 +107,9 @@ impl InnerCallHook for ScriptInnerCallHook {
         let output_token_estimate = record.output_token_estimate;
         let raw_args = record.args.clone();
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return;
+            }
             let Some(identity) = self.identity() else {
                 return;
             };
@@ -182,6 +193,9 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn on_page_created<'a>(&'a self, page_id: u32) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return;
+            }
             let Some(identity) = self.identity() else {
                 return;
             };
@@ -208,6 +222,9 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn annotate_pages<'a>(&'a self, pages: &'a [Value]) -> BoxFuture<'a, Vec<Value>> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return Vec::new();
+            }
             let Some(identity) = self.identity() else {
                 return pages.to_vec();
             };
@@ -226,6 +243,9 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn resolve_host<'a>(&'a self, page: u32) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return None;
+            }
             let browser = self.call.browser_session.as_ref()?;
             let info = browser.pages.get_info(PageId(page)).await?;
             helpers::host_bucket(&info.url)
@@ -239,6 +259,12 @@ impl InnerCallHook for ScriptInnerCallHook {
         source: &'a str,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return Err(format!(
+                    "{}: 受管理的執行環境拒絕任意程式碼",
+                    crate::freedom::CODE_RAW_EXEC
+                ));
+            }
             let Some(identity) = self.identity() else {
                 return Err("no agent identity for this script".to_string());
             };
@@ -261,6 +287,9 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn list_helpers<'a>(&'a self, host: &'a str) -> BoxFuture<'a, Vec<Value>> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return Vec::new();
+            }
             let now = now_epoch_ms();
             helpers::list_helper_meta(&self.call.state.config.browserclaw_dir, host)
                 .iter()
@@ -271,6 +300,9 @@ impl InnerCallHook for ScriptInnerCallHook {
 
     fn read_helper<'a>(&'a self, host: &'a str, name: &'a str) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
+            if self.call.state.freedom.is_managed() {
+                return None;
+            }
             // The agent-facing read returns the full self-documenting doc
             // (description, call form, source), not the bare source: hot-load uses
             // the extracted source; a reader wants the context.

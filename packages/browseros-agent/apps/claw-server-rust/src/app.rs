@@ -6,6 +6,7 @@ use crate::{
         AuditLog, DATABASE_FILENAME, Database, RecordingIndex, SessionTabLedger, SkillsRepository,
     },
     error::{AppError, AppResult},
+    freedom::{FreedomRuntime, FreedomVerifier},
     runtime::ShutdownHandle,
     services::{
         audit::AuditWorker,
@@ -57,6 +58,9 @@ pub struct AppState {
     pub help: Arc<crate::services::help::HelpRegistry>,
     pub extension_updates: Arc<crate::services::extension_updates::ExtensionUpdates>,
     pub shutdown: ShutdownHandle,
+    /// Process mode. Standalone unless this process was started managed.
+    /// Not reloaded from settings, MCP, or a sidecar edit after start.
+    pub freedom: Arc<FreedomRuntime>,
 }
 
 /// Overall cap on how long a human-help request stays open before it is reaped, so a crashed or
@@ -70,6 +74,45 @@ impl AppState {
     }
 
     pub async fn new_with_home(config: Arc<Config>, home_dir: PathBuf) -> AppResult<Self> {
+        // Freedom: a managed marker refuses the standalone opener. Checked before
+        // this function creates databases in that directory.
+        if crate::freedom::profile_is_managed(&config.browserclaw_dir).await? {
+            return Err(AppError::Internal(
+                "this profile is a Freedom managed profile and cannot be opened in standalone mode"
+                    .to_string(),
+            ));
+        }
+        let freedom =
+            FreedomRuntime::standalone(config.server_port, config.browserclaw_dir.clone());
+        Self::build(config, home_dir, freedom).await
+    }
+
+    /// Managed mode. Resolves the profile, then creates it, checks it, and
+    /// writes the marker on that same directory.
+    /// `standalone_dir` is the default standalone profile and must be distinct.
+    pub async fn new_managed_with_home(
+        config: Arc<Config>,
+        home_dir: PathBuf,
+        standalone_dir: PathBuf,
+        verifier: Arc<dyn FreedomVerifier>,
+    ) -> AppResult<Self> {
+        let resolved =
+            crate::freedom::bind_distinct_profiles(&config.browserclaw_dir, &standalone_dir)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+        let mut config = (*config).clone();
+        config.browserclaw_dir = resolved;
+        let config = Arc::new(config);
+        crate::freedom::write_managed_marker(&config.browserclaw_dir).await?;
+        let freedom =
+            FreedomRuntime::managed(config.server_port, config.browserclaw_dir.clone(), verifier);
+        Self::build(config, home_dir, freedom).await
+    }
+
+    async fn build(
+        config: Arc<Config>,
+        home_dir: PathBuf,
+        freedom: Arc<FreedomRuntime>,
+    ) -> AppResult<Self> {
         tokio::fs::create_dir_all(&config.browserclaw_dir).await?;
         let store = JsonStore::new(config.browserclaw_dir.clone());
         let database = Database::open(config.browserclaw_dir.join(DATABASE_FILENAME)).await?;
@@ -212,6 +255,7 @@ impl AppState {
             help: Arc::new(crate::services::help::HelpRegistry::new(HELP_MAX_WAIT)),
             extension_updates: Arc::default(),
             shutdown: ShutdownHandle::new(),
+            freedom,
         })
     }
 
@@ -219,6 +263,10 @@ impl AppState {
         let session = self.browser.session().await;
         self.tab_activity.snapshot(session.as_deref()).await
     }
+}
+
+pub fn resolve_user_home() -> AppResult<PathBuf> {
+    resolve_user_home_with(|name| env::var_os(name))
 }
 
 fn resolve_user_home_with(mut lookup: impl FnMut(&str) -> Option<OsString>) -> AppResult<PathBuf> {
@@ -234,9 +282,14 @@ fn resolve_user_home_with(mut lookup: impl FnMut(&str) -> Option<OsString>) -> A
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // The layer is inside the stateful router so request_context can read AppState.
+    // Standalone behavior of the handlers is unchanged.
     http::router(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            http::request_context,
+        ))
         .with_state(state)
-        .layer(middleware::from_fn(http::request_context))
 }
 
 #[cfg(test)]

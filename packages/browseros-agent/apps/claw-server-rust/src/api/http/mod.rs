@@ -4,15 +4,17 @@ use super::mcp::streamable_http_service;
 use crate::{
     AppState,
     error::{AppError, CanonicalError, RequestId},
+    freedom::{self, FreedomLocalAuth, HttpGate},
 };
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Request},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use serde_json::json;
 use std::time::Instant;
 use tracing::{Instrument, info_span};
 use ulid::Ulid;
@@ -108,6 +110,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(skills::get).put(skills::update).delete(skills::delete),
         )
         .route("/api/v1/skills/{name}/runs", get(skills::list_runs))
+        .route("/freedom/v1/status", get(freedom_status))
         .nest_service(
             "/mcp",
             Router::new()
@@ -175,18 +178,44 @@ async fn options_preflight(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-pub async fn request_context(mut req: Request, next: Next) -> Response {
+pub async fn request_context(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let request_id = RequestId(Ulid::new().to_string());
     req.extensions_mut().insert(request_id.clone());
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let reject_origin = (path == "/api/v1/recordings/events"
-        && !trusted_recording_origin(req.headers()))
-        || (path == "/api/v1/extension/update-ready" && !trusted_update_origin(req.headers()));
+    let managed = state.freedom.is_managed();
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let gate = freedom::decide_http(&state.freedom, method.as_str(), &path, req.headers(), peer);
+    let freedom_denied = match gate {
+        HttpGate::Deny {
+            status,
+            code,
+            message,
+        } => Some(CanonicalError::new(status, code, message, Some(&request_id)).into_response()),
+        HttpGate::Continue { local_authorized } => {
+            if local_authorized {
+                req.extensions_mut().insert(FreedomLocalAuth);
+            }
+            None
+        }
+    };
+    let freedom_blocked = freedom_denied.is_some();
+    let reject_origin = freedom_denied.is_none()
+        && ((path == "/api/v1/recordings/events" && !trusted_recording_origin(req.headers()))
+            || (path == "/api/v1/extension/update-ready" && !trusted_update_origin(req.headers())));
     let span = info_span!("http_request", request_id = %request_id.0, %method, %path);
     async move {
         let start = Instant::now();
-        let mut response = if reject_origin {
+        let mut response = if let Some(denied) = freedom_denied {
+            denied
+        } else if reject_origin {
             CanonicalError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -209,7 +238,8 @@ pub async fn request_context(mut req: Request, next: Next) -> Response {
             }
         }
         let headers = response.headers_mut();
-        if !reject_origin {
+        // Managed mode does not advertise a wildcard origin. Standalone keeps it.
+        if !managed && !reject_origin && !freedom_blocked {
             headers.insert(
                 header::ACCESS_CONTROL_ALLOW_ORIGIN,
                 HeaderValue::from_static("*"),
@@ -254,6 +284,26 @@ fn trusted_recording_origin(headers: &axum::http::HeaderMap) -> bool {
         }
         Some(_) => false,
     }
+}
+
+/// Loopback status. The handler refuses to run without the local-auth extension.
+async fn freedom_status(
+    Extension(request_id): Extension<RequestId>,
+    auth: Option<Extension<FreedomLocalAuth>>,
+    State(state): State<AppState>,
+) -> Result<axum::Json<serde_json::Value>, CanonicalError> {
+    if auth.is_none() {
+        return Err(error(
+            &request_id,
+            StatusCode::UNAUTHORIZED,
+            "freedom_token_denied",
+            "本機憑證無效",
+        ));
+    }
+    Ok(axum::Json(json!({
+        "status": "ok",
+        "mode": state.freedom.mode_name(),
+    })))
 }
 
 async fn route_fallback(request: Request) -> StatusCode {

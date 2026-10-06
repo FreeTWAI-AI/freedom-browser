@@ -28,6 +28,8 @@ enum Layer {
     Identity,
     Support,
     Composition,
+    /// Managed-mode policy. It may not reach HTTP, MCP, services, or the database.
+    Freedom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +42,7 @@ enum Target {
     Identity,
     Support,
     Composition,
+    Freedom,
 }
 
 #[derive(Default)]
@@ -193,6 +196,48 @@ fn api_http_cannot_define_manual_serialized_response_dtos() {
             .iter()
             .any(|error| error.contains("claw_api::models::CockpitStats"))
     );
+}
+
+#[test]
+fn freedom_guard_is_reachable_from_api_and_closed_below_it() {
+    assert!(
+        check_source(
+            Path::new("api/http/example.rs"),
+            "use crate::freedom::decide_http;",
+        )
+        .is_ok()
+    );
+    assert!(
+        check_source(
+            Path::new("api/mcp/example.rs"),
+            "use crate::freedom::precheck_mcp_tool;",
+        )
+        .is_ok()
+    );
+    assert!(
+        check_source(
+            Path::new("freedom/example.rs"),
+            "use crate::freedom::registry::surfaces;",
+        )
+        .is_ok()
+    );
+    let errors = violations("freedom/example.rs", "use crate::api::http;");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("freedom -> api/http"))
+    );
+    let errors = violations(
+        "services/browser/example.rs",
+        "use crate::freedom::FreedomRuntime;",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("services/browser -> freedom"))
+    );
+    let errors = violations("db/example.rs", "use crate::freedom::FreedomRuntime;");
+    assert!(errors.iter().any(|error| error.contains("db -> freedom")));
 }
 
 #[test]
@@ -358,6 +403,7 @@ fn classify(relative: &Path) -> Result<Layer, String> {
         {
             Ok(Layer::Support)
         }
+        [freedom, ..] if freedom == "freedom" => Ok(Layer::Freedom),
         _ => Err("file is outside the approved architecture".to_string()),
     }
 }
@@ -393,6 +439,7 @@ fn crate_target(path: &[String], failures: &mut Vec<String>, display: &str) -> O
         "analytics" | "clock" | "config" | "error" | "ids" | "storage" | "AppResult" => {
             Some(Target::Support)
         }
+        "freedom" => Some(Target::Freedom),
         _ => None,
     }
 }
@@ -408,6 +455,7 @@ fn edge_allowed(source: &Layer, target: &Target) -> bool {
                 | Target::Db
                 | Target::Identity
                 | Target::Support
+                | Target::Freedom
         ),
         Layer::ApiMcp => matches!(
             target,
@@ -417,15 +465,21 @@ fn edge_allowed(source: &Layer, target: &Target) -> bool {
                 | Target::Db
                 | Target::Identity
                 | Target::Support
+                | Target::Freedom
         ),
         Layer::Service(source) => match target {
             Target::Service(target) if source == target => true,
             Target::Service(target) => allowed_service_edge(source, target),
             Target::Db | Target::Identity | Target::Support => true,
-            Target::ApiHttp | Target::ApiMcp | Target::AppState | Target::Composition => false,
+            Target::ApiHttp
+            | Target::ApiMcp
+            | Target::AppState
+            | Target::Composition
+            | Target::Freedom => false,
         },
         Layer::Db => matches!(target, Target::Db | Target::Support),
         Layer::Identity | Layer::Support => matches!(target, Target::Identity | Target::Support),
+        Layer::Freedom => matches!(target, Target::Freedom | Target::Support),
     }
 }
 
@@ -450,6 +504,7 @@ fn layer_name(layer: &Layer) -> String {
         Layer::Identity => "identity".to_string(),
         Layer::Support => "support".to_string(),
         Layer::Composition => "composition".to_string(),
+        Layer::Freedom => "freedom".to_string(),
     }
 }
 
@@ -463,6 +518,7 @@ fn target_name(target: &Target) -> String {
         Target::Identity => "identity".to_string(),
         Target::Support => "support".to_string(),
         Target::Composition => "composition".to_string(),
+        Target::Freedom => "freedom".to_string(),
     }
 }
 

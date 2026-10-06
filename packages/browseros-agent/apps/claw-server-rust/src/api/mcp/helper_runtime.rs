@@ -45,6 +45,9 @@ pub(crate) async fn preload_helpers(
     caller: &ConvoId,
     session: &BrowserSession,
 ) -> Vec<HelperSource> {
+    if state.freedom.is_managed() {
+        return Vec::new();
+    }
     let dir = &state.config.browserclaw_dir;
     if !helpers::has_any_helpers(dir) {
         return Vec::new();
@@ -89,6 +92,9 @@ pub fn discovery(
     context: ToolEffectContext<'_>,
 ) -> BoxFuture<'_, anyhow::Result<Option<ToolResult>>> {
     Box::pin(async move {
+        if context.call.state.freedom.is_managed() {
+            return Ok(None);
+        }
         if context.result.is_error
             || context.cancelled
             || !ARBITRARY_SCRIPT_TOOLS.contains(&context.call.tool().name)
@@ -129,6 +135,20 @@ pub fn discovery(
 }
 
 const _: ToolEffect = discovery;
+
+/// Nested helper or script execution entry. Managed mode denies it with the
+/// same code as a direct `run`/`evaluate` call. Standalone does not execute
+/// `source` from this function; the script runtime is the only standalone path.
+pub fn execute_nested(state: &AppState, source: &str) -> Result<(), String> {
+    let _ = source;
+    if state.freedom.is_managed() {
+        return Err(format!(
+            "{}: 受管理的執行環境拒絕任意程式碼",
+            crate::freedom::CODE_RAW_EXEC
+        ));
+    }
+    Err("helper execution is only available inside a standalone script runtime".to_string())
+}
 
 /// A concise, agent-readable summary of the helpers available on the tabs' hosts:
 /// per helper a freshness signal, a description, and the exact call form to copy.

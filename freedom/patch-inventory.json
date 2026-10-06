@@ -1,0 +1,136 @@
+{
+  "adopted_base": "671b9a956eb4aaba42760b7eda754b9ba56191cd",
+  "note": "Every path that differs from adopted_base. A newer upstream SHA requires this inventory and the managed-mode coverage tests to be run again. License and notice files are unchanged and are not listed here.",
+  "paths": [
+    {
+      "path": "FREEDOM.md",
+      "status": "new",
+      "purpose": "Fork bookkeeping: upstream relationship, managed versus standalone mode, visible AGPL obligations, and the statement that no Freedom release exists yet."
+    },
+    {
+      "path": "freedom/patch-inventory.json",
+      "status": "new",
+      "purpose": "Machine-readable list of paths changed from the adopted base, with purpose and new-or-modified status."
+    },
+    {
+      "path": "freedom/patch-inventory.md",
+      "status": "new",
+      "purpose": "Readable patch inventory for the same paths as patch-inventory.json."
+    },
+    {
+      "path": "freedom/upstream.lock.json",
+      "status": "new",
+      "purpose": "Pins the upstream repository, research pin, adopted base, license expression, and preserved notice files."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/http/mod.rs",
+      "status": "modified",
+      "purpose": "Runs the managed-mode HTTP gate before handlers, adds loopback /freedom/v1/status, and stops wildcard CORS in managed mode."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/http/settings.rs",
+      "status": "modified",
+      "purpose": "Rejects settings writes that try to switch or relax managed mode, without applying the rest of that write."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/dispatch.rs",
+      "status": "modified",
+      "purpose": "Sends managed tool calls through the Freedom pipeline before the upstream guards. Cancellation uses the client token and the operator stop flag, not result text."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/guards/navigate_scheme.rs",
+      "status": "modified",
+      "purpose": "In managed mode, navigate calls the shared http(s) and about:blank allowlist. Standalone keeps the upstream scheme refusal and its English error text."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/helper_runtime.rs",
+      "status": "modified",
+      "purpose": "Denies nested helper execution in managed mode and skips helper preload and discovery."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/mod.rs",
+      "status": "modified",
+      "purpose": "Re-exports server-local MCP tool names so the coverage registry can see them."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/script_hook.rs",
+      "status": "modified",
+      "purpose": "Denies nested script primitives, helper reads, and page claims while the process is managed."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/api/mcp/service.rs",
+      "status": "modified",
+      "purpose": "Prechecks every MCP tool call before session resolution. Managed request_human_help pins only the granted page, not the cockpit active tab."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/app.rs",
+      "status": "modified",
+      "purpose": "Holds the process Freedom runtime, refuses to open a managed profile in standalone mode, and writes the managed marker only on the resolved distinct profile directory."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/config.rs",
+      "status": "modified",
+      "purpose": "Adds the startup-only --freedom-managed and --freedom-profile flags and the default standalone directory helper."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/context.rs",
+      "status": "new",
+      "purpose": "Verifying constructor for FreedomRunContext. No Default, no public fields, and no deserializer."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/guard.rs",
+      "status": "new",
+      "purpose": "Managed-mode pipeline. tabs active and new are unscoped, request_human_help needs an in-scope page, and navigation URLs are an http(s) or about:blank allowlist. The view-source prefix is matched on a character boundary."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/local_api.rs",
+      "status": "new",
+      "purpose": "Loopback peer, Host, Origin, per-process native token, and single-use nonce checks for /freedom/v1."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/mod.rs",
+      "status": "new",
+      "purpose": "Process-wide Freedom runtime. Mode is fixed after startup and the journal never records business acceptance."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/mode.rs",
+      "status": "new",
+      "purpose": "Resolves managed versus standalone from the CLI and sidecar. An existing marker file is managed. Profile paths are canonicalized as given, without a lexical .. pop; a .. left in a missing tail fails closed."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/freedom/registry.rs",
+      "status": "new",
+      "purpose": "Coverage registry of HTTP routes, MCP tools, and native entry points with managed-mode treatment."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/lib.rs",
+      "status": "modified",
+      "purpose": "Declares the freedom module."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/src/main.rs",
+      "status": "modified",
+      "purpose": "Selects managed mode only at process start, resolves the managed profile before creating logs, binds 127.0.0.1, and publishes the bound port for the Host allowlist."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/tests/dependency_boundaries.rs",
+      "status": "modified",
+      "purpose": "Admits src/freedom as its own layer. HTTP and MCP may call it. The guard cannot depend on HTTP, MCP, services, or the database."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/tests/freedom_coverage.rs",
+      "status": "new",
+      "purpose": "NEO-08 registry drift checks and the property test that every effect surface is denied without a context."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/tests/freedom_managed.rs",
+      "status": "new",
+      "purpose": "NEO-01, NEO-02, NEO-03, NEO-04, NEO-05, NEO-06, NEO-07, and NEO-12 integration cases, plus standalone unchanged."
+    },
+    {
+      "path": "packages/browseros-agent/apps/claw-server-rust/tests/freedom_patch_inventory.rs",
+      "status": "new",
+      "purpose": "Fails when the git diff against the adopted base and this inventory disagree. Uses local git only."
+    }
+  ]
+}

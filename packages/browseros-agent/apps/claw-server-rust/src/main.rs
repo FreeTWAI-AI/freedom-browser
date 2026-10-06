@@ -6,6 +6,8 @@ use claw_server_rust::{
     api::mcp::browser_mcp_service,
     build_router,
     config::{Cli, CliAction},
+    freedom::{self, ClosedVerifier, loopback_bind_addr, refuse_non_loopback},
+    resolve_user_home,
 };
 use rmcp::{serve_server, transport::stdio};
 use serde_json::json;
@@ -13,6 +15,7 @@ use std::{
     future::Future,
     io::{self, Write},
     net::SocketAddr,
+    path::Path,
     sync::Arc,
 };
 use tokio::net::TcpListener;
@@ -43,16 +46,53 @@ struct PortConflict {
 async fn main() -> anyhow::Result<()> {
     std::hint::black_box(VERSION_MARKER);
     std::hint::black_box(POSTHOG_KEY_MARKER);
-    let (config_path, stdio_mode) = match Cli::parse_action() {
+    let (config_path, stdio_mode, freedom_managed, freedom_profile) = match Cli::parse_action() {
         CliAction::Version => {
             writeln!(io::stdout().lock(), "{VERSION}")?;
             return Ok(());
         }
-        CliAction::Run { config, stdio } => (config, stdio),
+        CliAction::Run {
+            config,
+            stdio,
+            freedom_managed,
+            freedom_profile,
+        } => (config, stdio, freedom_managed, freedom_profile),
     };
-    let config = Arc::new(claw_server_rust::config::Config::load(config_path)?);
+    // Freedom mode is fixed here. HTTP settings and MCP cannot change it later.
+    let startup = freedom::resolve_startup(freedom_managed, freedom_profile, &config_path)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let mut loaded = claw_server_rust::config::Config::load(&config_path)?;
+    let managed_home = if startup.managed {
+        let profile = startup
+            .profile
+            .ok_or_else(|| anyhow::anyhow!("managed mode requires a profile directory"))?;
+        let home = resolve_user_home()?;
+        // Resolve before tracing creates a logs directory. `absolute_path`
+        // keeps `..`; bind follows that path the way the filesystem will.
+        let requested = absolute_path(&profile)?;
+        let standalone_dir =
+            claw_server_rust::config::Config::default_standalone_dir(&home, loaded.dev_mode);
+        loaded.browserclaw_dir = freedom::bind_distinct_profiles(&requested, &standalone_dir)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Some(home)
+    } else {
+        None
+    };
+    let config = Arc::new(loaded);
     let _guard = init_tracing(config.clone())?;
-    let state = AppState::new(config.clone()).await?;
+    let state = if let Some(home) = managed_home {
+        let standalone_dir =
+            claw_server_rust::config::Config::default_standalone_dir(&home, config.dev_mode);
+        AppState::new_managed_with_home(
+            config.clone(),
+            home,
+            standalone_dir,
+            Arc::new(ClosedVerifier),
+        )
+        .await?
+    } else {
+        AppState::new(config.clone()).await?
+    };
     let mut runtime = AppRuntime::start(state);
     let run_result = run(&mut runtime, config, stdio_mode).await;
     let shutdown_result = runtime.shutdown().await;
@@ -149,7 +189,8 @@ async fn serve_with_boot_task(
     analytics: Arc<dyn AnalyticsSink>,
     boot_task: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.server_port));
+    let addr = loopback_bind_addr(config.server_port);
+    refuse_non_loopback(addr).map_err(|error| anyhow::anyhow!("{error}"))?;
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -181,6 +222,8 @@ async fn serve_with_boot_task(
     // Use the ACTUAL bound address, not the requested port, so an OS-assigned
     // or dev port (config port 0) is still published correctly.
     let bound = listener.local_addr().unwrap_or(addr);
+    // Publishing the bound port updates the Host allowlist only. It does not change mode.
+    runtime.state().freedom.publish_bound_port(bound.port());
     info!(%bound, "claw-server-rust listening");
     // Publish the canonical MCP URL for external discovery (the Codex and Claude
     // Desktop plugins). This is the proxy port (the source of truth), falling
@@ -205,10 +248,21 @@ async fn serve_with_boot_task(
     });
     let shutdown = runtime.state().shutdown;
     runtime.spawn_task("harness integration reconciliation", boot_task);
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(wait_for_shutdown(shutdown))
-        .await
-        .context("claw-server listener failed")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown))
+    .await
+    .context("claw-server listener failed")
+}
+
+fn absolute_path(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 async fn serve_stdio(state: AppState) -> anyhow::Result<()> {

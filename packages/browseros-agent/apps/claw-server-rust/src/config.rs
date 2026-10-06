@@ -21,18 +21,33 @@ const DEV_BROWSERCLAW_DIR_NAME: &str = ".browserclaw-dev";
 #[derive(Debug, Parser)]
 #[command(name = "browseros-claw-server-rs")]
 pub struct Cli {
-    #[arg(long, conflicts_with_all = ["config", "stdio"], help = "Print version")]
+    #[arg(
+        long,
+        conflicts_with_all = ["config", "stdio", "freedom_managed", "freedom_profile"],
+        help = "Print version"
+    )]
     version: bool,
     #[arg(long, required_unless_present = "version")]
     config: Option<PathBuf>,
     #[arg(long)]
     stdio: bool,
+    /// Freedom managed mode. Chosen only at process start.
+    #[arg(long)]
+    freedom_managed: bool,
+    /// Data directory for managed mode. Must differ from the standalone profile.
+    #[arg(long)]
+    freedom_profile: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliAction {
     Version,
-    Run { config: PathBuf, stdio: bool },
+    Run {
+        config: PathBuf,
+        stdio: bool,
+        freedom_managed: bool,
+        freedom_profile: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -47,6 +62,8 @@ impl Cli {
             (false, Some(config)) => CliAction::Run {
                 config,
                 stdio: self.stdio,
+                freedom_managed: self.freedom_managed,
+                freedom_profile: self.freedom_profile,
             },
             _ => unreachable!("Clap enforces version and run argument constraints"),
         }
@@ -132,6 +149,16 @@ struct SidecarReplay {
 }
 
 impl Config {
+    /// Default standalone data directory. Ignores `BROWSERCLAW_DIR`.
+    #[must_use]
+    pub fn default_standalone_dir(home: &Path, dev_mode: bool) -> PathBuf {
+        home.join(if dev_mode {
+            DEV_BROWSERCLAW_DIR_NAME
+        } else {
+            BROWSERCLAW_DIR_NAME
+        })
+    }
+
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::load_with_env(path, &ConfigEnv::from_process())
     }
