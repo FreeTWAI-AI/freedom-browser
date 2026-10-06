@@ -1,0 +1,20 @@
+{
+  "upstream_repository": "browseros-ai/BrowserOS",
+  "upstream_repository_id": 985839104,
+  "research_pin": "53c3799ce014e9fee05569802314a05d0bad3e40",
+  "adopted_base": "671b9a956eb4aaba42760b7eda754b9ba56191cd",
+  "license": "AGPL-3.0-or-later",
+  "preserved_notice_files": [
+    "CLA.md",
+    "LICENSE",
+    "LICENSE.ungoogled_chromium",
+    "packages/browseros-agent/CLA.md",
+    "packages/browseros-agent/LICENSE",
+    "packages/browseros-agent/packages/acpx-ai-provider/LICENSE",
+    "packages/browseros-agent/packages/agent-mcp-manager/LICENSE",
+    "packages/browseros-agent/packages/agent-mcp-manager/THIRD_PARTY_NOTICES.md",
+    "packages/browseros/bos_build/steps/patches/fixtures/LICENSE",
+    "signatures/version1/cla.json"
+  ],
+  "note": "research_pin is an ancestor of adopted_base and is the spec's research starting point. Newer upstream SHAs require re-running the patch inventory and the managed-mode coverage tests before adoption. UI components whose names contain Notice are product copy, not license notices, and are not in this list."
+}
