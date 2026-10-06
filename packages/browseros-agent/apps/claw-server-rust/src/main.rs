@@ -67,7 +67,13 @@ async fn main() -> anyhow::Result<()> {
             .profile
             .ok_or_else(|| anyhow::anyhow!("managed mode requires a profile directory"))?;
         let home = resolve_user_home()?;
-        loaded.browserclaw_dir = absolute_path(&profile)?;
+        // Resolve before tracing creates a logs directory. `absolute_path`
+        // keeps `..`; bind follows that path the way the filesystem will.
+        let requested = absolute_path(&profile)?;
+        let standalone_dir =
+            claw_server_rust::config::Config::default_standalone_dir(&home, loaded.dev_mode);
+        loaded.browserclaw_dir = freedom::bind_distinct_profiles(&requested, &standalone_dir)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Some(home)
     } else {
         None

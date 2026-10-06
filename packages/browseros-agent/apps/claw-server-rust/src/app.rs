@@ -87,7 +87,8 @@ impl AppState {
         Self::build(config, home_dir, freedom).await
     }
 
-    /// Managed mode. Writes the profile marker, then builds state in that directory.
+    /// Managed mode. Resolves the profile, then creates it, checks it, and
+    /// writes the marker on that same directory.
     /// `standalone_dir` is the default standalone profile and must be distinct.
     pub async fn new_managed_with_home(
         config: Arc<Config>,
@@ -95,9 +96,12 @@ impl AppState {
         standalone_dir: PathBuf,
         verifier: Arc<dyn FreedomVerifier>,
     ) -> AppResult<Self> {
-        crate::freedom::bind_distinct_profiles(&config.browserclaw_dir, &standalone_dir)
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        tokio::fs::create_dir_all(&config.browserclaw_dir).await?;
+        let resolved =
+            crate::freedom::bind_distinct_profiles(&config.browserclaw_dir, &standalone_dir)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+        let mut config = (*config).clone();
+        config.browserclaw_dir = resolved;
+        let config = Arc::new(config);
         crate::freedom::write_managed_marker(&config.browserclaw_dir).await?;
         let freedom =
             FreedomRuntime::managed(config.server_port, config.browserclaw_dir.clone(), verifier);

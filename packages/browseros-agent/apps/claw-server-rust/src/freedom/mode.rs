@@ -147,21 +147,24 @@ pub fn ensure_distinct(managed: &Path, standalone: &Path) -> Result<(), ProfileE
     }
 }
 
-/// Create the managed directory, resolve both paths, then reject overlap.
+/// Resolve both profiles the way the filesystem will, reject overlap, then
+/// create the managed directory on that resolved path.
 ///
-/// A missing tail is rebuilt from the deepest existing ancestor. Any other
-/// resolution failure refuses the profile. Comparison is in both directions
-/// after symlink resolution.
-pub fn bind_distinct_profiles(managed: &Path, standalone: &Path) -> Result<(), ProfileError> {
-    std::fs::create_dir_all(managed).map_err(|error| {
+/// `..` is not removed lexically before resolution. A missing tail is the
+/// deepest existing ancestor of the path as given, plus the remaining
+/// components. A `..` that is still among those missing components fails
+/// closed. The returned directory is the one startup must mark.
+pub fn bind_distinct_profiles(managed: &Path, standalone: &Path) -> Result<PathBuf, ProfileError> {
+    let managed = canonicalize_profile(managed)?;
+    let standalone = canonicalize_profile(standalone)?;
+    ensure_distinct(&managed, &standalone)?;
+    std::fs::create_dir_all(&managed).map_err(|error| {
         ProfileError::Unresolvable(format!(
             "could not create the managed profile {}: {error}",
             managed.display()
         ))
     })?;
-    let managed = canonicalize_profile(managed)?;
-    let standalone = canonicalize_profile(standalone)?;
-    ensure_distinct(&managed, &standalone)
+    Ok(managed)
 }
 
 pub async fn profile_is_managed(dir: &Path) -> io::Result<bool> {
@@ -223,65 +226,80 @@ fn canonicalize_profile(path: &Path) -> Result<PathBuf, ProfileError> {
         })?;
         current.join(path)
     };
-    canonicalize_with_existing_ancestor(&normalize(&absolute))
+    // Do not pop `..` before the filesystem resolves the path. A lexical pop
+    // would treat `link/../profile` as a sibling of `link` even when `link`
+    // is a symlink.
+    resolve_filesystem_path(&absolute)
 }
 
-fn canonicalize_with_existing_ancestor(path: &Path) -> Result<PathBuf, ProfileError> {
+fn resolve_filesystem_path(path: &Path) -> Result<PathBuf, ProfileError> {
     match std::fs::canonicalize(path) {
         Ok(resolved) if resolved.is_dir() => Ok(resolved),
         Ok(resolved) => Err(ProfileError::Unresolvable(format!(
             "profile path is not a directory: {}",
             resolved.display()
         ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut missing = Vec::new();
-            let mut cursor = path.to_path_buf();
-            loop {
-                let Some(parent) = cursor.parent() else {
-                    return Err(ProfileError::Unresolvable(
-                        "no existing ancestor for the profile path".to_string(),
-                    ));
-                };
-                if parent.as_os_str().is_empty() || parent == cursor {
-                    return Err(ProfileError::Unresolvable(
-                        "no existing ancestor for the profile path".to_string(),
-                    ));
-                }
-                let Some(name) = cursor.file_name() else {
-                    return Err(ProfileError::Unresolvable(
-                        "profile path has no final component".to_string(),
-                    ));
-                };
-                missing.push(name.to_os_string());
-                match std::fs::canonicalize(parent) {
-                    Ok(resolved) if resolved.is_dir() => {
-                        missing.reverse();
-                        let mut out = resolved;
-                        for component in missing {
-                            out.push(component);
-                        }
-                        return Ok(out);
-                    }
-                    Ok(resolved) => {
-                        return Err(ProfileError::Unresolvable(format!(
-                            "profile ancestor is not a directory: {}",
-                            resolved.display()
-                        )));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        cursor = parent.to_path_buf();
-                    }
-                    Err(error) => {
-                        return Err(ProfileError::Unresolvable(format!(
-                            "could not resolve profile path: {error}"
-                        )));
-                    }
-                }
-            }
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => resolve_missing_tail(path),
         Err(error) => Err(ProfileError::Unresolvable(format!(
             "could not resolve profile path: {error}"
         ))),
+    }
+}
+
+/// Deepest existing ancestor of `path` as given, plus the components that
+/// do not exist yet. `..` in that missing tail is an error. It is not popped.
+fn resolve_missing_tail(path: &Path) -> Result<PathBuf, ProfileError> {
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        let Some(parent) = cursor.parent() else {
+            return Err(ProfileError::Unresolvable(
+                "no existing ancestor for the profile path".to_string(),
+            ));
+        };
+        if parent.as_os_str().is_empty() || parent == cursor {
+            return Err(ProfileError::Unresolvable(
+                "no existing ancestor for the profile path".to_string(),
+            ));
+        }
+        match cursor.components().next_back() {
+            Some(Component::Normal(name)) => missing.push(name.to_os_string()),
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                return Err(ProfileError::Unresolvable(
+                    "unresolved .. in the missing profile tail".to_string(),
+                ));
+            }
+            _ => {
+                return Err(ProfileError::Unresolvable(
+                    "profile path has no final component".to_string(),
+                ));
+            }
+        }
+        match std::fs::canonicalize(parent) {
+            Ok(resolved) if resolved.is_dir() => {
+                missing.reverse();
+                let mut out = resolved;
+                for component in missing {
+                    out.push(component);
+                }
+                return Ok(out);
+            }
+            Ok(resolved) => {
+                return Err(ProfileError::Unresolvable(format!(
+                    "profile ancestor is not a directory: {}",
+                    resolved.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                cursor = parent.to_path_buf();
+            }
+            Err(error) => {
+                return Err(ProfileError::Unresolvable(format!(
+                    "could not resolve profile path: {error}"
+                )));
+            }
+        }
     }
 }
 
@@ -511,5 +529,144 @@ mod tests {
         bind_distinct_profiles(&onto_third, &standalone).unwrap_or_else(|error| panic!("{error}"));
         assert!(third.is_dir());
         assert!(!third.join(super::MARKER_FILE).exists());
+    }
+
+    #[test]
+    fn finding5_unresolved_dotdot_in_missing_tail_fails_closed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let standalone = dir.path().join("standalone");
+        let managed = dir
+            .path()
+            .join("missing")
+            .join("..")
+            .join("managed-profile");
+        let Err(error) = bind_distinct_profiles(&managed, &standalone) else {
+            panic!("a .. through a missing directory must fail closed");
+        };
+        assert!(matches!(error, ProfileError::Unresolvable(_)));
+        assert!(!dir.path().join("managed-profile").exists());
+        assert_no_marker_under(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finding5_dotdot_through_symlink_into_standalone_is_not_distinct() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let standalone = dir.path().join("standalone");
+        let inside = standalone.join("inside");
+        std::fs::create_dir_all(&inside).unwrap_or_else(|error| panic!("{error}"));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap_or_else(|error| panic!("{error}"));
+        let managed = link.join("..").join("managed-profile");
+        assert_eq!(
+            bind_distinct_profiles(&managed, &standalone),
+            Err(ProfileError::NotDistinct)
+        );
+        assert!(
+            !standalone.join("managed-profile").exists(),
+            "refusing must not create the directory inside standalone"
+        );
+        assert!(!dir.path().join("managed-profile").exists());
+        assert_no_marker_under(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finding5_symlinked_ancestor_in_the_middle_is_not_distinct() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let standalone = dir.path().join("standalone");
+        let inside = standalone.join("inside");
+        std::fs::create_dir_all(&inside).unwrap_or_else(|error| panic!("{error}"));
+        let middle = dir.path().join("middle");
+        std::fs::create_dir_all(&middle).unwrap_or_else(|error| panic!("{error}"));
+        let link = middle.join("link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap_or_else(|error| panic!("{error}"));
+        let managed = link.join("managed-profile");
+        assert_eq!(
+            bind_distinct_profiles(&managed, &standalone),
+            Err(ProfileError::NotDistinct)
+        );
+        assert!(!inside.join("managed-profile").exists());
+        assert_no_marker_under(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finding5_reverse_symlink_ancestor_is_not_distinct() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let managed = dir.path().join("managed");
+        let inside = managed.join("inside");
+        std::fs::create_dir_all(&inside).unwrap_or_else(|error| panic!("{error}"));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap_or_else(|error| panic!("{error}"));
+
+        let standalone_dotdot = link.join("..").join("nested");
+        assert_eq!(
+            bind_distinct_profiles(&managed, &standalone_dotdot),
+            Err(ProfileError::NotDistinct)
+        );
+        assert!(!managed.join("nested").exists());
+
+        let middle = dir.path().join("middle");
+        std::fs::create_dir_all(&middle).unwrap_or_else(|error| panic!("{error}"));
+        let middle_link = middle.join("link");
+        std::os::unix::fs::symlink(&inside, &middle_link).unwrap_or_else(|error| panic!("{error}"));
+        let standalone_middle = middle_link.join("nested");
+        assert_eq!(
+            bind_distinct_profiles(&managed, &standalone_middle),
+            Err(ProfileError::NotDistinct)
+        );
+        assert!(!inside.join("nested").exists());
+        assert_no_marker_under(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finding5_resolved_outside_symlink_is_not_the_lexical_parent() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("inside")).unwrap_or_else(|error| panic!("{error}"));
+        let standalone = dir.path().join("standalone");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.join("inside"), &link)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let managed = link.join("..").join("managed-profile");
+        let resolved =
+            bind_distinct_profiles(&managed, &standalone).unwrap_or_else(|error| panic!("{error}"));
+        let expected = outside.join("managed-profile");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&expected).unwrap_or_else(|error| panic!("{error}"))
+        );
+        assert!(expected.is_dir());
+        assert!(!dir.path().join("managed-profile").exists());
+        assert!(!expected.join(super::MARKER_FILE).exists());
+    }
+
+    fn assert_no_marker_under(root: &std::path::Path) {
+        fn walk(dir: &std::path::Path) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{error}"));
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|error| panic!("{error}"));
+                let path = entry.path();
+                let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    walk(&path);
+                } else {
+                    assert_ne!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(super::MARKER_FILE),
+                        "marker written at {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if root.is_dir() {
+            walk(root);
+        }
     }
 }

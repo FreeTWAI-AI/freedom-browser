@@ -899,6 +899,172 @@ async fn finding5_symlink_onto_standalone_refuses_before_the_marker() -> anyhow:
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn finding5_dotdot_through_symlink_refuses_before_the_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let standalone = dir.path().join("standalone");
+    let inside = standalone.join("inside");
+    tokio::fs::create_dir_all(&inside).await?;
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&inside, &link)?;
+    let managed = link.join("..").join("managed-profile");
+    let opened = AppState::new_managed_with_home(
+        config_at(&managed),
+        home,
+        standalone.clone(),
+        Arc::new(ClosedVerifier),
+    )
+    .await;
+    let Err(error) = opened else {
+        panic!("link/../managed-profile inside standalone was accepted");
+    };
+    assert!(
+        error.to_string().contains("freedom_profile_not_distinct"),
+        "{error}"
+    );
+    assert!(!standalone.join("managed-profile").exists());
+    assert_no_marker_under(dir.path());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn finding5_middle_symlink_refuses_before_the_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let standalone = dir.path().join("standalone");
+    let inside = standalone.join("inside");
+    tokio::fs::create_dir_all(&inside).await?;
+    let middle = dir.path().join("middle");
+    tokio::fs::create_dir_all(&middle).await?;
+    let link = middle.join("link");
+    std::os::unix::fs::symlink(&inside, &link)?;
+    let managed = link.join("managed-profile");
+    let opened = AppState::new_managed_with_home(
+        config_at(&managed),
+        home,
+        standalone,
+        Arc::new(ClosedVerifier),
+    )
+    .await;
+    assert!(
+        opened.is_err(),
+        "symlinked ancestor inside standalone was accepted"
+    );
+    assert!(!inside.join("managed-profile").exists());
+    assert_no_marker_under(dir.path());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn finding5_reverse_symlink_ancestor_refuses_before_the_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let managed = dir.path().join("managed");
+    let inside = managed.join("inside");
+    tokio::fs::create_dir_all(&inside).await?;
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&inside, &link)?;
+    let standalone = link.join("..").join("nested");
+    let opened = AppState::new_managed_with_home(
+        config_at(&managed),
+        home.clone(),
+        standalone,
+        Arc::new(ClosedVerifier),
+    )
+    .await;
+    assert!(
+        opened.is_err(),
+        "standalone link/.. inside managed was accepted"
+    );
+
+    let middle = dir.path().join("middle");
+    tokio::fs::create_dir_all(&middle).await?;
+    let middle_link = middle.join("link");
+    std::os::unix::fs::symlink(&inside, &middle_link)?;
+    let opened = AppState::new_managed_with_home(
+        config_at(&managed),
+        home,
+        middle_link.join("nested"),
+        Arc::new(ClosedVerifier),
+    )
+    .await;
+    assert!(
+        opened.is_err(),
+        "standalone symlink ancestor inside managed was accepted"
+    );
+    assert!(
+        !inside
+            .join("nested")
+            .join("freedom-managed-profile.json")
+            .exists()
+    );
+    assert!(!managed.join("freedom-managed-profile.json").exists());
+    assert_no_marker_under(dir.path());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn finding5_marker_is_written_on_the_resolved_directory() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    tokio::fs::create_dir_all(&home).await?;
+    let outside = dir.path().join("outside");
+    tokio::fs::create_dir_all(outside.join("inside")).await?;
+    let standalone = dir.path().join("standalone");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(outside.join("inside"), &link)?;
+    let requested = link.join("..").join("managed-profile");
+    let state = AppState::new_managed_with_home(
+        config_at(&requested),
+        home,
+        standalone,
+        Arc::new(ClosedVerifier),
+    )
+    .await?;
+    let expected = std::fs::canonicalize(outside.join("managed-profile"))?;
+    assert_eq!(state.config.browserclaw_dir, expected);
+    assert_eq!(state.freedom.profile_dir(), expected.as_path());
+    assert!(expected.join("freedom-managed-profile.json").is_file());
+    assert!(!dir.path().join("managed-profile").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_no_marker_under(root: &Path) {
+    fn walk(dir: &Path) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => panic!("read {}: {error}", dir.display()),
+        };
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| panic!("{error}"));
+            let path = entry.path();
+            let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                walk(&path);
+            } else if path.file_name().and_then(|name| name.to_str())
+                == Some("freedom-managed-profile.json")
+            {
+                panic!("marker written at {}", path.display());
+            }
+        }
+    }
+    if root.is_dir() {
+        walk(root);
+    }
+}
+
 struct FixtureConnection {
     events: broadcast::Sender<CdpEvent>,
     url: &'static str,
