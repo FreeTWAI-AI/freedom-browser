@@ -418,6 +418,20 @@ mod tests {
         BoundAttempt::matching_pair("alice", "attempt-1", Scope::pages([1]))
     }
 
+    fn generated_token() -> String {
+        let mut bytes = [0_u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn generated_token_other_than(blocked: &str) -> String {
+        let mut candidate = generated_token();
+        while candidate == blocked {
+            candidate = generated_token();
+        }
+        candidate
+    }
+
     #[test]
     fn accepts_a_consistent_binding() {
         let (auth, attempt) = pair();
@@ -661,8 +675,10 @@ mod tests {
         );
         let mut verifier = InProcessVerifier::new();
         let (auth, attempt) = pair();
-        verifier.insert("token-alice", auth, attempt);
-        match FreedomVerifier::authenticate(&verifier, "") {
+        let token = generated_token();
+        verifier.insert(token, auth, attempt);
+        let empty = String::new();
+        match FreedomVerifier::authenticate(&verifier, &empty) {
             Err(super::VerifyFailure::UnknownToken) => {}
             other => panic!("empty token must fail: {other:?}"),
         }
@@ -672,13 +688,15 @@ mod tests {
     fn verifier_unknown_token_fails_and_label_is_not_part_of_the_trait() {
         let mut verifier = InProcessVerifier::new();
         let (auth, attempt) = pair();
-        verifier.insert("token-alice", auth, attempt);
-        let err = match FreedomVerifier::authenticate(&verifier, "Ted") {
+        let token = generated_token();
+        verifier.insert(token.clone(), auth, attempt);
+        let unknown = generated_token_other_than(&token);
+        let err = match FreedomVerifier::authenticate(&verifier, &unknown) {
             Ok(_) => panic!("a session label must not authenticate"),
             Err(error) => error,
         };
         assert_eq!(err, super::VerifyFailure::UnknownToken);
-        let (auth, _) = match FreedomVerifier::authenticate(&verifier, "token-alice") {
+        let (auth, _) = match FreedomVerifier::authenticate(&verifier, &token) {
             Ok(pair) => pair,
             Err(error) => panic!("known token should verify: {error:?}"),
         };

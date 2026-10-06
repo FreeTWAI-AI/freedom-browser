@@ -51,6 +51,14 @@ fn fresh_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn credential_other_than(blocked: &str) -> String {
+    let mut candidate = fresh_token();
+    while candidate == blocked {
+        candidate = fresh_token();
+    }
+    candidate
+}
+
 fn config_at(dir: &Path) -> Arc<Config> {
     Arc::new(Config {
         server_port: 9200,
@@ -366,6 +374,10 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     let (_dir, state, _token) = managed_app(Scope::process_only()).await?;
     let router = build_router(state.clone());
     let native = state.freedom.native_token().to_string();
+    let nonce_ok = fresh_token();
+    let nonce_after_denied_token = fresh_token();
+    let nonce_bad_host = fresh_token();
+    let wrong_native = credential_other_than(&native);
 
     let mut ok = loopback_request("GET", "/freedom/v1/status")?;
     ok.headers_mut().insert(
@@ -376,7 +388,7 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     );
     ok.headers_mut().insert(
         "x-freedom-nonce",
-        "nonce-a"
+        nonce_ok
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );
@@ -395,7 +407,7 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     );
     replay.headers_mut().insert(
         "x-freedom-nonce",
-        "nonce-a"
+        nonce_ok
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );
@@ -414,16 +426,35 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "freedom_nonce_missing");
 
+    // Present but empty. Built without a string literal flowing into the nonce.
+    let empty_nonce = String::new();
+    let mut empty_nonce_request = loopback_request("GET", "/freedom/v1/status")?;
+    empty_nonce_request.headers_mut().insert(
+        "x-freedom-native-token",
+        native
+            .parse()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+    );
+    empty_nonce_request.headers_mut().insert(
+        "x-freedom-nonce",
+        empty_nonce
+            .parse()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+    );
+    let (status, body) = response_json(router.clone().oneshot(empty_nonce_request).await?).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "freedom_nonce_missing");
+
     let mut bad_token = loopback_request("GET", "/freedom/v1/status")?;
     bad_token.headers_mut().insert(
         "x-freedom-native-token",
-        "not-the-process-token"
+        wrong_native
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );
     bad_token.headers_mut().insert(
         "x-freedom-nonce",
-        "nonce-b"
+        nonce_after_denied_token
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );
@@ -439,7 +470,7 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     );
     nonce_survives.headers_mut().insert(
         "x-freedom-nonce",
-        "nonce-b"
+        nonce_after_denied_token
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );
@@ -461,7 +492,7 @@ async fn neo05_local_rest_rejects_bad_host_origin_nonce_and_peer() -> anyhow::Re
     );
     bad_host.headers_mut().insert(
         "x-freedom-nonce",
-        "nonce-c"
+        nonce_bad_host
             .parse()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
     );

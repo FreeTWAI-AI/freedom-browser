@@ -132,14 +132,18 @@ pub fn authorize(
     if !origin_allowed(headers, runtime.bound_port()) {
         return Err(LocalError::Origin);
     }
-    let presented = header_str(headers, HEADER_TOKEN).unwrap_or("");
+    let Some(presented) = header_str(headers, HEADER_TOKEN) else {
+        return Err(LocalError::Token);
+    };
     if presented.is_empty()
         || presented.len() > TOKEN_MAX_LEN
         || !constant_time_eq(presented, runtime.native_token())
     {
         return Err(LocalError::Token);
     }
-    let nonce = header_str(headers, HEADER_NONCE).unwrap_or("");
+    let Some(nonce) = header_str(headers, HEADER_NONCE) else {
+        return Err(LocalError::NonceMissing);
+    };
     consume_nonce(runtime, nonce)
 }
 
@@ -202,7 +206,10 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalError, authorize, loopback_bind_addr, refuse_non_loopback};
+    use super::{
+        LocalError, NONCE_MAX_LEN, authorize, generate_native_token, loopback_bind_addr,
+        refuse_non_loopback,
+    };
     use crate::freedom::{ClosedVerifier, FreedomRuntime};
     use axum::http::{HeaderMap, HeaderValue};
     use std::{
@@ -219,16 +226,25 @@ mod tests {
         )
     }
 
-    fn headers(token: &str, nonce: &str, host: &str, origin: Option<&str>) -> HeaderMap {
+    fn headers(
+        token: Option<&str>,
+        nonce: Option<&str>,
+        host: &str,
+        origin: Option<&str>,
+    ) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-freedom-native-token",
-            HeaderValue::from_str(token).unwrap_or_else(|_| panic!("token header")),
-        );
-        headers.insert(
-            "x-freedom-nonce",
-            HeaderValue::from_str(nonce).unwrap_or_else(|_| panic!("nonce header")),
-        );
+        if let Some(token) = token {
+            headers.insert(
+                "x-freedom-native-token",
+                HeaderValue::from_str(token).unwrap_or_else(|_| panic!("token header")),
+            );
+        }
+        if let Some(nonce) = nonce {
+            headers.insert(
+                "x-freedom-nonce",
+                HeaderValue::from_str(nonce).unwrap_or_else(|_| panic!("nonce header")),
+            );
+        }
         headers.insert(
             "host",
             HeaderValue::from_str(host).unwrap_or_else(|_| panic!("host header")),
@@ -240,6 +256,24 @@ mod tests {
             );
         }
         headers
+    }
+
+    fn credential_other_than(blocked: &str) -> String {
+        let mut candidate = generate_native_token();
+        while candidate == blocked {
+            candidate = generate_native_token();
+        }
+        candidate
+    }
+
+    // Repeats a generated value until it is longer than `NONCE_MAX_LEN`.
+    fn overlong_nonce() -> String {
+        let unit = generate_native_token();
+        let mut value = String::new();
+        while value.len() <= NONCE_MAX_LEN {
+            value.push_str(&unit);
+        }
+        value
     }
 
     #[test]
@@ -258,11 +292,12 @@ mod tests {
         let runtime = runtime();
         let token = runtime.native_token().to_string();
         let peer = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let ok = headers(&token, "nonce-1", "127.0.0.1:9200", None);
+        let nonce_ok = generate_native_token();
+        let ok = headers(Some(&token), Some(&nonce_ok), "127.0.0.1:9200", None);
         assert!(authorize(&runtime, &ok, peer).is_ok());
         let replay = headers(
-            &token,
-            "nonce-1",
+            Some(&token),
+            Some(&nonce_ok),
             "localhost:9200",
             Some("http://127.0.0.1:9200"),
         );
@@ -270,14 +305,21 @@ mod tests {
             authorize(&runtime, &replay, peer),
             Err(LocalError::NonceReplayed)
         );
-        let wrong_host = headers(&token, "nonce-2", "evil.example:9200", None);
+        let nonce_wrong_host = generate_native_token();
+        let wrong_host = headers(
+            Some(&token),
+            Some(&nonce_wrong_host),
+            "evil.example:9200",
+            None,
+        );
         assert_eq!(
             authorize(&runtime, &wrong_host, peer),
             Err(LocalError::Host)
         );
+        let nonce_wrong_origin = generate_native_token();
         let wrong_origin = headers(
-            &token,
-            "nonce-3",
+            Some(&token),
+            Some(&nonce_wrong_origin),
             "127.0.0.1:9200",
             Some("http://evil.example"),
         );
@@ -285,30 +327,127 @@ mod tests {
             authorize(&runtime, &wrong_origin, peer),
             Err(LocalError::Origin)
         );
-        let missing_nonce = headers(&token, "", "127.0.0.1:9200", None);
+        let missing_nonce = headers(Some(&token), None, "127.0.0.1:9200", None);
         assert_eq!(
             authorize(&runtime, &missing_nonce, peer),
             Err(LocalError::NonceMissing)
         );
-        let wrong_token = headers("not-the-token", "nonce-4", "127.0.0.1:9200", None);
+        // Present but empty. `String::new` is not a literal flowing into the nonce.
+        let empty_nonce = String::new();
+        assert!(empty_nonce.is_empty());
+        let empty_nonce_headers = headers(Some(&token), Some(&empty_nonce), "127.0.0.1:9200", None);
+        assert_eq!(
+            authorize(&runtime, &empty_nonce_headers, peer),
+            Err(LocalError::NonceMissing)
+        );
+        let overlong = overlong_nonce();
+        assert!(overlong.len() > NONCE_MAX_LEN);
+        let overlong_headers = headers(Some(&token), Some(&overlong), "127.0.0.1:9200", None);
+        assert_eq!(
+            authorize(&runtime, &overlong_headers, peer),
+            Err(LocalError::NonceMissing)
+        );
+        let nonce_wrong_token = generate_native_token();
+        let wrong_token_value = credential_other_than(&token);
+        let wrong_token = headers(
+            Some(&wrong_token_value),
+            Some(&nonce_wrong_token),
+            "127.0.0.1:9200",
+            None,
+        );
         assert_eq!(
             authorize(&runtime, &wrong_token, peer),
             Err(LocalError::Token)
         );
-        let after_bad_token = headers(&token, "nonce-4", "127.0.0.1:9200", None);
+        let after_bad_token = headers(
+            Some(&token),
+            Some(&nonce_wrong_token),
+            "127.0.0.1:9200",
+            None,
+        );
         assert!(authorize(&runtime, &after_bad_token, peer).is_ok());
+        let nonce_missing_token = generate_native_token();
+        let missing_token = headers(None, Some(&nonce_missing_token), "127.0.0.1:9200", None);
+        assert_eq!(
+            authorize(&runtime, &missing_token, peer),
+            Err(LocalError::Token)
+        );
+        let after_missing_token = headers(
+            Some(&token),
+            Some(&nonce_missing_token),
+            "127.0.0.1:9200",
+            None,
+        );
+        assert!(authorize(&runtime, &after_missing_token, peer).is_ok());
+        let empty_token = String::new();
+        let nonce_empty_token = generate_native_token();
+        let empty_token_headers = headers(
+            Some(&empty_token),
+            Some(&nonce_empty_token),
+            "127.0.0.1:9200",
+            None,
+        );
+        assert_eq!(
+            authorize(&runtime, &empty_token_headers, peer),
+            Err(LocalError::Token)
+        );
+        let after_empty_token = headers(
+            Some(&token),
+            Some(&nonce_empty_token),
+            "127.0.0.1:9200",
+            None,
+        );
+        assert!(authorize(&runtime, &after_empty_token, peer).is_ok());
         let public = Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
-        let public_headers = headers(&token, "nonce-5", "127.0.0.1:9200", None);
+        let nonce_public = generate_native_token();
+        let public_headers = headers(Some(&token), Some(&nonce_public), "127.0.0.1:9200", None);
         assert_eq!(
             authorize(&runtime, &public_headers, public),
             Err(LocalError::Peer)
         );
         let unspecified = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let unspecified_headers = headers(&token, "nonce-6", "127.0.0.1:9200", None);
+        let nonce_unspecified = generate_native_token();
+        let unspecified_headers = headers(
+            Some(&token),
+            Some(&nonce_unspecified),
+            "127.0.0.1:9200",
+            None,
+        );
         assert_eq!(
             authorize(&runtime, &unspecified_headers, unspecified),
             Err(LocalError::Peer)
         );
+        // Earlier checks win, and a rejected request does not consume the nonce.
+        let nonce_after_origin = generate_native_token();
+        let origin_before_token = headers(
+            None,
+            Some(&nonce_after_origin),
+            "127.0.0.1:9200",
+            Some("http://evil.example"),
+        );
+        assert_eq!(
+            authorize(&runtime, &origin_before_token, peer),
+            Err(LocalError::Origin)
+        );
+        let host_before_origin =
+            headers(None, None, "evil.example:9200", Some("http://evil.example"));
+        assert_eq!(
+            authorize(&runtime, &host_before_origin, peer),
+            Err(LocalError::Host)
+        );
+        let peer_before_host =
+            headers(None, None, "evil.example:9200", Some("http://evil.example"));
+        assert_eq!(
+            authorize(&runtime, &peer_before_host, public),
+            Err(LocalError::Peer)
+        );
+        let after_origin_reject = headers(
+            Some(&token),
+            Some(&nonce_after_origin),
+            "127.0.0.1:9200",
+            None,
+        );
+        assert!(authorize(&runtime, &after_origin_reject, peer).is_ok());
         assert_eq!(authorize(&runtime, &ok, None), Err(LocalError::Peer));
     }
 }
